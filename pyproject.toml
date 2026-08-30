@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vortex-ai-gateway"
+version = "0.1.0"
+description = "Multi-provider LLM gateway with provider abstraction, PII guardrails, rate limiting, and Redis load balancing"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.104.1",
+    "uvicorn>=0.24.0",
+    "pydantic>=2.5.0",
+    "redis>=5.0.0",
+    "httpx>=0.25.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.1.0",
+    "mypy>=1.7.0",
+    "pytest>=7.4.3",
+    "pytest-asyncio>=0.21.1",
+    "pytest-cov>=4.1.0",
+    "pre-commit>=3.5.0",
+    "types-redis>=4.6.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "RUF"]
+ignore = ["E501"]  # Line too long - handled by formatter
+
+[tool.ruff.format]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+explicit_package_bases = true
+mypy_path = "src"
+exclude = ["tests/"]
+
+[[tool.mypy.overrides]]
+module = "redis.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=src --cov-report=term-missing --strict-markers"
+pythonpath = ["src"]
+asyncio_mode = "auto"

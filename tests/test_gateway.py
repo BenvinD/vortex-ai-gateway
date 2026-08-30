@@ -1,20 +1,21 @@
 """Tests for gateway module."""
 
 import pytest
-from fastapi.testclient import starlette.testclient.TestClient
+from fastapi.testclient import TestClient
 
-from src.gateway import app
+from vortex_ai_gateway.gateway import create_app
 
 
 @pytest.fixture
-def client():
+def client() -> TestClient:
     """Create test client."""
-    from fastapi.testclient import TestClient
+    app = create_app()
     return TestClient(app)
 
 
-def test_health_check(client):
+def test_health_check(client: TestClient) -> None:
     """Test health check endpoint."""
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json()["status"] == "healthy"
+    data = response.json()
+    assert data["status"] == "healthy"
