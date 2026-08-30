@@ -1,6 +1,6 @@
 # vortex-ai-gateway
 
-**v0.2**
+**v0.3**
 
 ## What is This?
 
@@ -16,44 +16,66 @@ Together, **vortex-ai-gateway** evokes both the convergence point metaphor and t
 
 ## Getting Started
 
+This project uses [uv](https://docs.astral.sh/uv/) for dependency management.
+Python 3.14 is pinned in `.python-version`.
+
 ### Installation
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Creates the virtualenv, installs the project and dev tooling from uv.lock
+uv sync
 ```
 
 ### Running the Application
 
 ```bash
-# Start the gateway server
-uvicorn src.gateway:app --reload
+uv run uvicorn vortex_ai_gateway.gateway:app --reload
 ```
 
 The server will be available at `http://localhost:8000`
 
-### Testing
+### Development
 
 ```bash
-# Run all tests
-pytest tests/ -v
+uv run pytest            # tests with coverage
+uv run ruff check src tests   # lint
+uv run ruff format src tests  # format
+uv run mypy src          # strict type check
 
-# Run tests with coverage report
-pytest tests/ -v --cov=src --cov-report=html
+uv run pre-commit install    # enable hooks on commit
+uv run pre-commit run --all-files
 ```
+
+## Project Layout
+
+```
+src/vortex_ai_gateway/    # the package (src/ layout, not flat)
+tests/                    # imports the installed package, never src/
+```
+
+The `src/` layout is deliberate. Tests import `vortex_ai_gateway` from the
+installed distribution rather than from the working directory, so a packaging
+mistake — a module missing from the wheel, a bad `pyproject.toml` — fails the
+test run instead of being masked by Python finding the source tree first.
+CI enforces this by installing a built wheel (`uv sync --no-editable`), and
+the pytest config deliberately sets no `pythonpath`.
 
 ## CI/CD
 
-This repository uses GitHub Actions for continuous integration. Every push and pull request triggers:
+Every push and pull request runs, in order:
 
-- **Test Suite**: Python 3.10, 3.11, 3.12 compatibility testing
-- **Code Quality**: Basic linting with flake8
-- **Coverage**: Automated coverage tracking
+| Stage | Command |
+|-------|---------|
+| Install | `uv sync --locked --no-editable` |
+| Lint | `ruff check src tests` |
+| Format | `ruff format --check src tests` |
+| Types | `mypy src` (strict) |
+| Tests | `pytest -v` |
 
-The `main` branch is protected and requires:
-- ✅ All CI checks to pass
-- ✅ At least 1 pull request review
-- ✅ No force pushes or deletions
+`--locked` fails the build if `uv.lock` is out of step with `pyproject.toml`,
+so dependency changes cannot land without a matching lockfile update.
+
+The `main` branch requires these checks to pass and a pull request review.
 
 ## License
 
