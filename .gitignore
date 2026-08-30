@@ -41,4 +41,5 @@ htmlcov/
 .ruff_cache/
 
 # uv
-uv.lock
+# uv.lock is deliberately NOT ignored: this is an application, and the
+# lockfile is what makes CI and production installs reproducible.

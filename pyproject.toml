@@ -7,7 +7,7 @@ name = "vortex-ai-gateway"
 version = "0.1.0"
 description = "Multi-provider LLM gateway with provider abstraction, PII guardrails, rate limiting, and Redis load balancing"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 dependencies = [
     "fastapi>=0.104.1",
     "uvicorn>=0.24.0",
@@ -16,7 +16,9 @@ dependencies = [
     "httpx>=0.25.1",
 ]
 
-[project.optional-dependencies]
+# Dev tooling is a dependency-group, not an extra: it is installed by
+# `uv sync` and never published as part of the distribution.
+[dependency-groups]
 dev = [
     "ruff>=0.1.0",
     "mypy>=1.7.0",
@@ -29,7 +31,7 @@ dev = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py314"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
@@ -39,7 +41,7 @@ ignore = ["E501"]  # Line too long - handled by formatter
 [tool.ruff.format]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.14"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
@@ -54,12 +56,14 @@ explicit_package_bases = true
 mypy_path = "src"
 exclude = ["tests/"]
 
-[[tool.mypy.overrides]]
-module = "redis.*"
-ignore_missing_imports = true
+# Per-module `ignore_missing_imports` overrides go here as untyped third-party
+# packages are actually imported. Adding them pre-emptively makes mypy report
+# "unused section(s)" on every run.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=src --cov-report=term-missing --strict-markers"
-pythonpath = ["src"]
+# No `pythonpath` entry on purpose. With a src/ layout the tests must import
+# the *installed* package; putting src/ on sys.path here would defeat that and
+# let a broken build pass. Run `uv sync` (which installs the project) first.
+addopts = "--cov=vortex_ai_gateway --cov-report=term-missing --strict-markers"
 asyncio_mode = "auto"

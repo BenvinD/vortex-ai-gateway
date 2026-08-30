@@ -1,25 +1,42 @@
 repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.1.8
-    hooks:
-      - id: ruff
-        args: [--fix]
-      - id: ruff-format
-
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.7.0
-    hooks:
-      - id: mypy
-        additional_dependencies: ["types-redis"]
-        args: [--strict, src/]
-
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.5.0
+    rev: v5.0.0
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
       - id: check-added-large-files
         args: [--maxkb=1000]
-        exclude: uv.lock
-      - id: check-merge-conflict
+        # Lockfiles are legitimately large and must stay committed.
+        exclude: ^uv\.lock$
+
+  # These run the project's own tools through uv, so the versions here match
+  # CI and local development exactly. pre-commit's default isolated
+  # environments would install a different mypy with none of the project's
+  # dependencies present, which fails under --strict on every third-party
+  # import.
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff (lint)
+        entry: uv run --no-sync ruff check --fix
+        language: system
+        types_or: [python, pyi]
+
+      - id: ruff-format
+        name: ruff (format)
+        entry: uv run --no-sync ruff format
+        language: system
+        types_or: [python, pyi]
+
+      # pass_filenames must stay false: mypy is given the src/ package root,
+      # and appending individual file paths makes it resolve the same module
+      # twice ("Duplicate module named ...").
+      - id: mypy
+        name: mypy (strict)
+        entry: uv run --no-sync mypy src
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
