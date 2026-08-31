@@ -43,3 +43,9 @@ htmlcov/
 # uv
 # uv.lock is deliberately NOT ignored: this is an application, and the
 # lockfile is what makes CI and production installs reproducible.
+
+# Local environment config (secrets, machine-specific overrides).
+# Never committed — .env.example is the checked-in template.
+.env
+.env.*
+!.env.example

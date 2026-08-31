@@ -26,6 +26,19 @@ Python 3.14 is pinned in `.python-version`.
 uv sync
 ```
 
+### Configuration
+
+Settings load from environment variables prefixed `VORTEX_` (see
+`vortex_ai_gateway.config.Settings`). For local development, copy the template
+and edit as needed — `.env` is git-ignored and read automatically:
+
+```bash
+cp .env.example .env
+```
+
+Every setting has a default, so the app also runs with no `.env` at all. A real
+environment variable always overrides a line in `.env`.
+
 ### Running the Application
 
 ```bash
@@ -33,6 +46,15 @@ uv run uvicorn vortex_ai_gateway.gateway:app --reload
 ```
 
 The server will be available at `http://localhost:8000`
+
+### Logging
+
+Logs are emitted as one JSON object per line on stdout (structlog); pipe through
+`jq` in development. Every request is assigned a request ID — taken from an
+inbound `X-Request-ID` header or generated — which is attached to every log line
+for that request, returned in the `X-Request-ID` response header, and available
+to handlers as `request.state.request_id`. `VORTEX_LOG_LEVEL` sets the
+threshold.
 
 ### Development
 
