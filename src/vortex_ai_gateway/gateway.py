@@ -13,9 +13,12 @@ Health endpoints follow the Kubernetes probe split:
 
 from collections.abc import Awaitable, Callable
 
-from fastapi import FastAPI, Response, status
+from fastapi import FastAPI, Request, Response, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from vortex_ai_gateway.config import Settings, get_settings
+from vortex_ai_gateway.contracts import error_response_from_validation_error
 from vortex_ai_gateway.logging_config import configure_logging
 from vortex_ai_gateway.middleware import RequestIDMiddleware
 
@@ -40,6 +43,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     app.add_middleware(RequestIDMiddleware)
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:
+        """Report a malformed request in the OpenAI error envelope.
+
+        FastAPI's default is a ``422`` carrying pydantic's raw error list; an
+        OpenAI client understands neither. Translating to ``400`` plus
+        ``{"error": {...}}`` means an existing client surfaces the real reason
+        instead of a generic transport failure.
+        """
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=error_response_from_validation_error(exc.errors()).model_dump(mode="json"),
+        )
 
     # Dependency probes register here as subsystems come online, e.g. a Redis
     # PING once the load-balancer backend exists. Exposed on ``app.state`` so
