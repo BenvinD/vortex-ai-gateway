@@ -22,5 +22,8 @@ This repo is the gateway (Gatewright), which owns the `0xx` range.
 | 008 | Logging & request IDs | structlog JSON to stdout + raw-ASGI request-ID middleware | stdlib text logging; OpenTelemetry now | Need distributed traces/spans, not just correlation IDs |
 | 009 | Unified request/response contract | OpenAI chat-completions shape as the internal contract | bespoke Vortex schema; lowest-common-denominator subset | Gateway stops being a drop-in OpenAI replacement |
 | 010 | Request validation & errors | `extra="forbid"` + cross-field validators, OpenAI `400` error envelope | pass unknown fields through; ignore them | Gateway must proxy provider-specific extras verbatim |
+| 011 | Provider seam & test doubles | narrow `ChatProvider` protocol + scripted `MockProvider` | build the OpenAI adapter first; recorded HTTP fixtures | Verifying one adapter's translation against real vendor bytes |
+| 012 | Chat endpoint & stream framing | OpenAI SSE + `[DONE]`, injected provider, `502` buffered / in-band streamed errors | buffer-only now; `501` until a real adapter exists | Deploying for real, where a mock default is a liability |
+| 013 | Client authentication | `Authorization: Bearer` checked in a router-level dependency, `401` + envelope | leave `/v1` open for now; delegate to a fronting API gateway | A fronting gateway or mesh already authenticates every caller |
 
 Fill each row as the ADR lands. The `1xx` range belongs to the RAG repo.

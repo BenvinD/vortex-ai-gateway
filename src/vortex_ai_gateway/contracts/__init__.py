@@ -33,9 +33,11 @@ from vortex_ai_gateway.contracts.chat import (
     FunctionCallDelta,
     GatewayMetadata,
     LogitBias,
+    MessageAnnotation,
     ResponseMessage,
     ServiceTier,
     ToolCallDelta,
+    UrlCitation,
 )
 from vortex_ai_gateway.contracts.errors import (
     ErrorDetail,
@@ -116,6 +118,7 @@ __all__ = [
     "JsonSchemaResponseFormat",
     "LogitBias",
     "Message",
+    "MessageAnnotation",
     "ModelCard",
     "ModelList",
     "NamedToolChoice",
@@ -141,6 +144,7 @@ __all__ = [
     "ToolMessage",
     "TopLogprob",
     "UnixTimestamp",
+    "UrlCitation",
     "UserContentPart",
     "UserMessage",
     "error_response_from_validation_error",

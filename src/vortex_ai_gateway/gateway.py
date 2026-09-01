@@ -13,25 +13,36 @@ Health endpoints follow the Kubernetes probe split:
 
 from collections.abc import Awaitable, Callable
 
-from fastapi import FastAPI, Request, Response, status
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+import structlog
+from fastapi import FastAPI, Response, status
 
 from vortex_ai_gateway.config import Settings, get_settings
-from vortex_ai_gateway.contracts import error_response_from_validation_error
+from vortex_ai_gateway.error_handling import install_error_handlers
 from vortex_ai_gateway.logging_config import configure_logging
 from vortex_ai_gateway.middleware import RequestIDMiddleware
+from vortex_ai_gateway.providers import ChatProvider, MockProvider
+from vortex_ai_gateway.routes import create_chat_router
 
 #: A readiness check raises to signal "not ready"; returning means "ok".
 ReadinessCheck = Callable[[], Awaitable[None]]
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    provider: ChatProvider | None = None,
+) -> FastAPI:
     """Create and configure the FastAPI application.
 
     ``settings`` defaults to the process-wide config read from the environment;
     tests pass an explicit :class:`~vortex_ai_gateway.config.Settings` to avoid
     depending on the ambient environment or a local ``.env``.
+
+    ``provider`` serves ``/v1/chat/completions``. Until the vendor adapters
+    land, it defaults to
+    :class:`~vortex_ai_gateway.providers.mock.MockProvider` so the endpoint is
+    exercisable end to end with no key and no bill — a substitution loud enough
+    to be caught in the logs, since a deployment answering from canned replies
+    is the worst failure this service could have.
     """
     settings = settings or get_settings()
     configure_logging(settings)
@@ -42,21 +53,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         description="Multi-provider LLM gateway with routing and guardrails",
     )
     app.state.settings = settings
-    app.add_middleware(RequestIDMiddleware)
 
-    @app.exception_handler(RequestValidationError)
-    async def handle_invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:
-        """Report a malformed request in the OpenAI error envelope.
-
-        FastAPI's default is a ``422`` carrying pydantic's raw error list; an
-        OpenAI client understands neither. Translating to ``400`` plus
-        ``{"error": {...}}`` means an existing client surfaces the real reason
-        instead of a generic transport failure.
-        """
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content=error_response_from_validation_error(exc.errors()).model_dump(mode="json"),
+    if provider is None:
+        provider = MockProvider()
+        structlog.get_logger(__name__).warning(
+            "no provider configured; serving canned replies",
+            provider=provider.name,
+            environment=settings.environment,
         )
+    app.state.provider = provider
+
+    app.add_middleware(RequestIDMiddleware)
+    install_error_handlers(app)
+    app.include_router(create_chat_router(provider))
 
     # Dependency probes register here as subsystems come online, e.g. a Redis
     # PING once the load-balancer backend exists. Exposed on ``app.state`` so

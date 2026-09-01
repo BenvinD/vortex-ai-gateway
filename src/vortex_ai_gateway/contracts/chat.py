@@ -202,6 +202,22 @@ class ChatCompletionRequest(ContractModel):
         return self
 
 
+class UrlCitation(ContractModel):
+    """A source the model cited, with the span of text it supports."""
+
+    start_index: int = Field(ge=0)
+    end_index: int = Field(ge=0)
+    title: str
+    url: str
+
+
+class MessageAnnotation(ContractModel):
+    """Provenance attached to a span of the assistant's content."""
+
+    type: Literal["url_citation"] = "url_citation"
+    url_citation: UrlCitation
+
+
 class ResponseMessage(ContractModel):
     """The assistant turn the gateway produces."""
 
@@ -209,6 +225,7 @@ class ResponseMessage(ContractModel):
     content: str | None = None
     refusal: str | None = None
     tool_calls: list[ToolCall] | None = None
+    annotations: list[MessageAnnotation] | None = None
 
 
 class ChatCompletionChoice(ContractModel):

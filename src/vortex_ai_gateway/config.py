@@ -40,6 +40,22 @@ class Settings(BaseSettings):
     # HTTP timeout, in seconds, for calls out to upstream model providers.
     request_timeout_seconds: float = 30.0
 
+    # Client API keys accepted at the edge, comma-separated. Kept as a plain
+    # string rather than a set because pydantic-settings parses collection
+    # types from env vars as JSON, which is a hostile format for an operator
+    # typing a value into a deployment console.
+    api_keys: str = ""
+
+    @property
+    def allowed_api_keys(self) -> frozenset[str]:
+        """The accepted client keys, empty when the gateway is left open.
+
+        An empty set means *no key is checked beyond being present* — the
+        development default. Populate ``VORTEX_API_KEYS`` to enforce a real
+        allow-list.
+        """
+        return frozenset(key.strip() for key in self.api_keys.split(",") if key.strip())
+
 
 @lru_cache
 def get_settings() -> Settings:
