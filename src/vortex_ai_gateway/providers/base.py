@@ -6,9 +6,9 @@ vendor's own wire format happens *inside* an implementation; nothing
 provider-shaped crosses this boundary.
 
 The protocol is deliberately two methods wide. It is the contract
-:class:`~vortex_ai_gateway.providers.mock.MockProvider` implements today, and
-the surface the real adapters will widen (model listing, embeddings, health)
-when they land.
+:class:`~vortex_ai_gateway.providers.mock.MockProvider` and every vendor
+adapter satisfy, and it will widen (model listing, embeddings, health) only
+when something above it needs those.
 """
 
 from collections.abc import AsyncIterator

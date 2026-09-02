@@ -37,14 +37,48 @@ class Settings(BaseSettings):
     # Redis backs rate limiting and load balancing (see the pyproject scope).
     redis_url: str = "redis://localhost:6379/0"
 
-    # HTTP timeout, in seconds, for calls out to upstream model providers.
+    # How long to wait for an upstream provider's *answer*, in seconds. Long,
+    # because generating tokens is slow.
     request_timeout_seconds: float = 30.0
+
+    # How long to wait for the TCP/TLS handshake, in seconds. Deliberately much
+    # shorter: a host that has not accepted a connection in a few seconds is
+    # unreachable, not busy, and sharing the read budget with it means an
+    # unroutable IP pins a worker for the whole generation window
+    # (docs/notes/day-04.md).
+    connect_timeout_seconds: float = 5.0
 
     # Client API keys accepted at the edge, comma-separated. Kept as a plain
     # string rather than a set because pydantic-settings parses collection
     # types from env vars as JSON, which is a hostile format for an operator
     # typing a value into a deployment console.
     api_keys: str = ""
+
+    # Which provider serves which model, as an ordered, comma-separated list of
+    # `pattern=provider` rules — e.g.
+    #     gpt-4o=openai,claude-*=anthropic,local/*=ollama
+    # First match wins, so a specific rule may precede a general one. Parsed by
+    # `vortex_ai_gateway.routing`, which also owns the pattern syntax; this
+    # stays a plain string for the same reason `api_keys` does. The table is
+    # also the enable list: a provider no rule mentions is never constructed,
+    # and an empty table leaves the gateway on its mock (ADR-016, ADR-017).
+    model_routes: str = ""
+
+    # Where a model that matches no rule goes. Empty means "reject it", which
+    # is the safer default: a typo'd model name is a 400 rather than a
+    # surprise bill on whichever provider happened to be listed first.
+    default_provider: str = ""
+
+    # Per-provider credentials and endpoints. An empty base URL means "use the
+    # vendor's own", so only self-hosted or proxied deployments set one.
+    # `routing.build_router` finds these by name, so a fourth provider needs a
+    # matching `<name>_api_key` / `<name>_base_url` pair and nothing else.
+    openai_api_key: str = ""
+    openai_base_url: str = ""
+    anthropic_api_key: str = ""
+    anthropic_base_url: str = ""
+    ollama_api_key: str = ""
+    ollama_base_url: str = ""
 
     @property
     def allowed_api_keys(self) -> frozenset[str]:

@@ -25,5 +25,9 @@ This repo is the gateway (Gatewright), which owns the `0xx` range.
 | 011 | Provider seam & test doubles | narrow `ChatProvider` protocol + scripted `MockProvider` | build the OpenAI adapter first; recorded HTTP fixtures | Verifying one adapter's translation against real vendor bytes |
 | 012 | Chat endpoint & stream framing | OpenAI SSE + `[DONE]`, injected provider, `502` buffered / in-band streamed errors | buffer-only now; `501` until a real adapter exists | Deploying for real, where a mock default is a liability |
 | 013 | Client authentication | `Authorization: Bearer` checked in a router-level dependency, `401` + envelope | leave `/v1` open for now; delegate to a fronting API gateway | A fronting gateway or mesh already authenticates every caller |
+| 014 | Vendor adapters & translation | translate both ways per vendor, refuse what a vendor cannot express | drop unsupported params silently; narrow the contract to the intersection | Callers need one portable request across every provider |
+| 015 | Provider failure taxonomy | typed hierarchy with a `retryable` flag, classified once in the HTTP base | let httpx errors escape; one error class with a status | Only one provider exists and every failure maps to the same status |
+| 016 | Model → provider routing | ordered `pattern=provider` glob table, first match wins | exact-name dict; regexes; provider inferred in code | Selection needs weights, fallbacks or health, not just a name |
+| 017 | Where configuration lives | environment variables, parsed at boot | JSON/YAML file; embedded DB (LiteDB/SQLite) | The table must change at runtime — then Redis, not a local file |
 
 Fill each row as the ADR lands. The `1xx` range belongs to the RAG repo.

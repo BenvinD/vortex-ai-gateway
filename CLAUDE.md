@@ -35,10 +35,18 @@ only as the uvicorn entrypoint. Tests construct their own instance via
 `create_app()` rather than importing `app`, so keep configuration inside the
 factory rather than at module scope.
 
-Currently only `/health` exists. The intended scope (per `pyproject.toml` and
-the ADR index) is a multi-provider LLM gateway: provider abstraction, PII
-guardrails, rate limiting, and Redis-backed load balancing. `redis` and `httpx`
-are already declared dependencies but unused so far.
+`contracts/` defines the unified, OpenAI-shaped wire format and depends on
+nothing else. `providers/` holds the `ChatProvider` seam, a scripted
+`MockProvider`, and one adapter per vendor (OpenAI, Anthropic, Ollama), each
+translating that contract to and from its own format. `routing.py` maps model
+names onto providers from config and is itself a `ChatProvider`, so `create_app`
+mounts a router exactly where it would mount one adapter; with no routing table
+configured it falls back to the mock. `routes.py` owns the HTTP surface and the
+only place a provider failure becomes a status code.
+
+Still to come (per `pyproject.toml` and the ADR index): retries and circuit
+breaking, PII guardrails, rate limiting, and Redis-backed load balancing.
+`redis` is a declared dependency and still unused.
 
 ### The src/ layout is load-bearing
 

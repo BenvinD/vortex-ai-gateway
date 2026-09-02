@@ -5,6 +5,11 @@ JSON/SSE framing, the mapping from an upstream failure to an HTTP status, and
 the decision to stream. Everything else is delegated — validation to the
 contract models, generation to the injected
 :class:`~vortex_ai_gateway.providers.base.ChatProvider`.
+
+The status mapping is the reason the provider taxonomy exists (ADR-015). It
+lives here, not in the providers package, because an adapter must never have to
+know what HTTP status its caller will choose — and because the same
+classification has to serve the retry policy, which has no HTTP status at all.
 """
 
 from collections.abc import AsyncIterator
@@ -20,8 +25,17 @@ from vortex_ai_gateway.contracts import (
     ChatCompletionResponse,
     ErrorDetail,
     ErrorResponse,
+    ErrorType,
 )
 from vortex_ai_gateway.providers.base import ChatProvider
+from vortex_ai_gateway.providers.errors import (
+    ProviderAuthError,
+    ProviderBadRequest,
+    ProviderError,
+    ProviderRateLimited,
+    ProviderTimeout,
+)
+from vortex_ai_gateway.routing import UnroutableModelError
 
 logger = structlog.get_logger(__name__)
 
@@ -29,19 +43,54 @@ logger = structlog.get_logger(__name__)
 #: reading on it rather than on the connection closing.
 SSE_DONE = "data: [DONE]\n\n"
 
+#: How each provider failure is reported. Checked in order, so a subclass may
+#: precede its parent; anything unmatched is a ``502``.
+#:
+#: Two of these are deliberate refusals to pass the upstream status through.
+#: A ``401`` from a vendor means *our* key is wrong, so reporting ``401`` would
+#: tell the caller to fix a key that is perfectly good; and an upstream timeout
+#: is a gateway timeout, ``504``, not a ``500``.
+FAILURE_STATUSES: tuple[tuple[type[ProviderError], int, ErrorType], ...] = (
+    (UnroutableModelError, status.HTTP_404_NOT_FOUND, "invalid_request_error"),
+    (ProviderBadRequest, status.HTTP_400_BAD_REQUEST, "invalid_request_error"),
+    (ProviderRateLimited, status.HTTP_429_TOO_MANY_REQUESTS, "rate_limit_error"),
+    (ProviderTimeout, status.HTTP_504_GATEWAY_TIMEOUT, "api_error"),
+    (ProviderAuthError, status.HTTP_502_BAD_GATEWAY, "api_error"),
+)
+
 
 def _sse(payload: str) -> str:
     """Frame one JSON document as a server-sent event."""
     return f"data: {payload}\n\n"
 
 
-def _upstream_failure(exc: Exception) -> ErrorResponse:
-    """Describe a provider failure without leaking its internals to the caller."""
-    return ErrorResponse(
+def _failure(exc: Exception) -> tuple[int, ErrorResponse]:
+    """Turn a failure into the status and envelope the caller should see."""
+    if not isinstance(exc, ProviderError):
+        return status.HTTP_502_BAD_GATEWAY, ErrorResponse(
+            error=ErrorDetail(
+                message=f"The upstream provider failed to serve this request: {exc}",
+                type="api_error",
+                code=type(exc).__name__,
+            )
+        )
+
+    http_status: int = status.HTTP_502_BAD_GATEWAY
+    error_type: ErrorType = "api_error"
+    for failure_type, mapped_status, mapped_error in FAILURE_STATUSES:
+        if isinstance(exc, failure_type):
+            http_status, error_type = mapped_status, mapped_error
+            break
+
+    return http_status, ErrorResponse(
         error=ErrorDetail(
-            message=f"The upstream provider failed to serve this request: {exc}",
-            type="api_error",
-            code=type(exc).__name__,
+            message=str(exc),
+            type=error_type,
+            # `param` is set only by the failures that know which field was at
+            # fault — an unsupported parameter names itself, and that is the
+            # difference between a fixable 400 and a mysterious one.
+            param=getattr(exc, "parameter", None),
+            code=exc.code or type(exc).__name__,
         )
     )
 
@@ -68,7 +117,10 @@ def create_chat_router(provider: ChatProvider) -> APIRouter:
         responses={
             200: {"model": ChatCompletionResponse},
             400: {"model": ErrorResponse},
+            404: {"model": ErrorResponse},
+            429: {"model": ErrorResponse},
             502: {"model": ErrorResponse},
+            504: {"model": ErrorResponse},
         },
     )
     async def create_chat_completion(request: ChatCompletionRequest) -> Response:
@@ -90,9 +142,12 @@ def create_chat_router(provider: ChatProvider) -> APIRouter:
             completion = await provider.complete(request)
         except Exception as exc:
             logger.exception("provider request failed", provider=provider.name, model=request.model)
+            http_status, envelope = _failure(exc)
+            retry_after = getattr(exc, "retry_after", None)
             return JSONResponse(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                content=_upstream_failure(exc).model_dump(mode="json"),
+                status_code=http_status,
+                content=envelope.model_dump(mode="json"),
+                headers={"Retry-After": str(int(retry_after))} if retry_after else None,
             )
 
         return JSONResponse(content=completion.model_dump(mode="json", exclude_none=True))
@@ -114,6 +169,6 @@ async def _stream_events(
             yield _sse(chunk.model_dump_json(exclude_none=True))
     except Exception as exc:
         logger.exception("provider stream failed", provider=provider.name, model=request.model)
-        yield _sse(_upstream_failure(exc).model_dump_json())
+        yield _sse(_failure(exc)[1].model_dump_json())
 
     yield SSE_DONE

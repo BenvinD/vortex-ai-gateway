@@ -11,7 +11,8 @@ Health endpoints follow the Kubernetes probe split:
   the load balancer **stops routing to this instance** without it being killed.
 """
 
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI, Response, status
@@ -22,6 +23,7 @@ from vortex_ai_gateway.logging_config import configure_logging
 from vortex_ai_gateway.middleware import RequestIDMiddleware
 from vortex_ai_gateway.providers import ChatProvider, MockProvider
 from vortex_ai_gateway.routes import create_chat_router
+from vortex_ai_gateway.routing import build_router
 
 #: A readiness check raises to signal "not ready"; returning means "ok".
 ReadinessCheck = Callable[[], Awaitable[None]]
@@ -37,23 +39,22 @@ def create_app(
     tests pass an explicit :class:`~vortex_ai_gateway.config.Settings` to avoid
     depending on the ambient environment or a local ``.env``.
 
-    ``provider`` serves ``/v1/chat/completions``. Until the vendor adapters
-    land, it defaults to
-    :class:`~vortex_ai_gateway.providers.mock.MockProvider` so the endpoint is
-    exercisable end to end with no key and no bill — a substitution loud enough
-    to be caught in the logs, since a deployment answering from canned replies
-    is the worst failure this service could have.
+    ``provider`` serves ``/v1/chat/completions``. Left out, it is built from
+    the routing table in ``settings`` (ADR-016); with no table configured it
+    falls back to :class:`~vortex_ai_gateway.providers.mock.MockProvider` so
+    the endpoint is exercisable end to end with no key and no bill — a
+    substitution loud enough to be caught in the logs, since a deployment
+    answering from canned replies is the worst failure this service could have.
+
+    A provider the factory built is closed on shutdown; one passed in belongs
+    to the caller and is left alone.
     """
     settings = settings or get_settings()
     configure_logging(settings)
 
-    app = FastAPI(
-        title="Vortex AI Gateway",
-        version="0.1.0",
-        description="Multi-provider LLM gateway with routing and guardrails",
-    )
-    app.state.settings = settings
-
+    owns_provider = provider is None
+    if provider is None:
+        provider = build_router(settings)
     if provider is None:
         provider = MockProvider()
         structlog.get_logger(__name__).warning(
@@ -61,6 +62,24 @@ def create_app(
             provider=provider.name,
             environment=settings.environment,
         )
+
+    served_by = provider
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        """Hold the app open, then release the upstream connection pools."""
+        yield
+        closer = getattr(served_by, "aclose", None) if owns_provider else None
+        if closer is not None:
+            await closer()
+
+    app = FastAPI(
+        title="Vortex AI Gateway",
+        version="0.1.0",
+        description="Multi-provider LLM gateway with routing and guardrails",
+        lifespan=lifespan,
+    )
+    app.state.settings = settings
     app.state.provider = provider
 
     app.add_middleware(RequestIDMiddleware)

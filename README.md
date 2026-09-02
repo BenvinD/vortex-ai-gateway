@@ -39,6 +39,35 @@ cp .env.example .env
 Every setting has a default, so the app also runs with no `.env` at all. A real
 environment variable always overrides a line in `.env`.
 
+### Provider routing
+
+Which vendor serves which model is one ordered, comma-separated table. First
+match wins, so a specific rule may precede a general one, and patterns are
+shell globs:
+
+```bash
+VORTEX_MODEL_ROUTES=gpt-4o=openai,gpt-*=openai,claude-*=anthropic,local/*=ollama
+VORTEX_OPENAI_API_KEY=sk-...
+VORTEX_ANTHROPIC_API_KEY=sk-ant-...
+```
+
+The table is also the enable list. Only the providers it names are constructed;
+one that is named without its key stops the gateway at startup rather than on
+the first request that routes there; and a model no rule claims is rejected with
+a `404`, unless `VORTEX_DEFAULT_PROVIDER` says where to send it. Leave the table
+empty — the default — and the gateway answers from its built-in mock provider,
+loudly, so a keyless checkout still works end to end.
+
+Callers keep using the OpenAI wire format throughout: the model name in the
+request body is what selects the provider, and the response names the one that
+served it under `vortex.provider`.
+
+Two timeouts, not one: `VORTEX_REQUEST_TIMEOUT_SECONDS` (default 30) budgets the
+*answer*, and `VORTEX_CONNECT_TIMEOUT_SECONDS` (default 5) budgets the
+connection. They are separate because sharing a number lets an unreachable host
+hold a worker for the full generation window — measured in
+[`docs/notes/day-04.md`](docs/notes/day-04.md).
+
 ### Running the Application
 
 ```bash
