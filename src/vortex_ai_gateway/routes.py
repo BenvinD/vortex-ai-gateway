@@ -10,8 +10,13 @@ The status mapping is the reason the provider taxonomy exists (ADR-015). It
 lives here, not in the providers package, because an adapter must never have to
 know what HTTP status its caller will choose — and because the same
 classification has to serve the retry policy, which has no HTTP status at all.
+
+What a stream *cost* is not framing, so it is not here either:
+:mod:`~vortex_ai_gateway.streaming` owns the accounting, and this module owns
+only the decision to hand each chunk to the client.
 """
 
+import asyncio
 from collections.abc import AsyncIterator
 
 import structlog
@@ -36,6 +41,7 @@ from vortex_ai_gateway.providers.errors import (
     ProviderTimeout,
 )
 from vortex_ai_gateway.routing import UnroutableModelError
+from vortex_ai_gateway.streaming import StreamRecord, aclose_stream, metered, wants_usage
 
 logger = structlog.get_logger(__name__)
 
@@ -160,15 +166,48 @@ async def _stream_events(
 ) -> AsyncIterator[str]:
     """Yield the SSE body for a streaming completion.
 
-    A failure part-way through is emitted as one final error event: the status
-    line is long gone, so this is the only way the client learns the stream was
-    truncated rather than finished.
-    """
-    try:
-        async for chunk in provider.stream(request):
-            yield _sse(chunk.model_dump_json(exclude_none=True))
-    except Exception as exc:
-        logger.exception("provider stream failed", provider=provider.name, model=request.model)
-        yield _sse(_failure(exc)[1].model_dump_json())
+    Three ways this ends, and all three have to leave the same trail — a
+    :class:`~vortex_ai_gateway.streaming.StreamRecord` naming what the request
+    cost — because the gateway is billed for the tokens whichever way it went:
 
-    yield SSE_DONE
+    * **Completed.** The provider ran out of chunks; the sentinel goes out.
+    * **Failed.** The status line is long gone, so the error is emitted as one
+      final event before the sentinel. That is the only way the client learns
+      the stream was truncated rather than finished.
+    * **Abandoned.** The client hung up and Starlette cancelled this task. The
+      cancellation is recorded and *re-raised*, so it carries on into the
+      provider's own generator, whose ``finally`` closes the upstream
+      connection and stops tokens nobody will read (ADR-019). Catching it to
+      return quietly would leave the upstream generating at our expense.
+
+    ``CancelledError`` and ``GeneratorExit`` are named explicitly rather than
+    left to ``except Exception``: they are ``BaseException``, so the failure
+    branch already misses them, and a reader should not have to know that to
+    see that an abandonment is handled.
+    """
+    record = StreamRecord(provider=provider.name, model=request.model)
+    forward_usage = wants_usage(request)
+    # The gateway asks for usage on every stream; only the forwarding is
+    # conditional. See `streaming.metered`.
+    stream = provider.stream(metered(request))
+    try:
+        try:
+            async for chunk in stream:
+                forwarded = record.observe(chunk, forward_usage=forward_usage)
+                if forwarded is not None:
+                    yield _sse(forwarded.model_dump_json(exclude_none=True))
+        except asyncio.CancelledError, GeneratorExit:
+            record.outcome = "abandoned"
+            raise
+        except Exception as exc:
+            record.outcome = "failed"
+            logger.exception("provider stream failed", provider=provider.name, model=request.model)
+            yield _sse(_failure(exc)[1].model_dump_json())
+
+        yield SSE_DONE
+    finally:
+        # The bill first, and unconditionally: closing the upstream may itself
+        # be cancelled, and a stream that is never accounted for is the one
+        # failure this whole path exists to prevent.
+        record.log()
+        await aclose_stream(stream)

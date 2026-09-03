@@ -42,11 +42,17 @@ translating that contract to and from its own format. `routing.py` maps model
 names onto providers from config and is itself a `ChatProvider`, so `create_app`
 mounts a router exactly where it would mount one adapter; with no routing table
 configured it falls back to the mock. `routes.py` owns the HTTP surface and the
-only place a provider failure becomes a status code.
+only place a provider failure becomes a status code. `streaming.py` owns what a
+stream *costs*: it asks every provider for usage regardless of what the caller
+requested, strips the usage chunk back out when the caller did not ask
+(ADR-018), and writes one `stream finished` record per streamed request —
+including the abandoned ones, where the client hung up and the cancellation was
+carried into the provider's generator to close the upstream (ADR-019).
 
-Still to come (per `pyproject.toml` and the ADR index): retries and circuit
-breaking, PII guardrails, rate limiting, and Redis-backed load balancing.
-`redis` is a declared dependency and still unused.
+Still to come (per `pyproject.toml` and the ADR index): cost accounting on top
+of `StreamRecord`, retries and circuit breaking, PII guardrails, rate limiting,
+and Redis-backed load balancing. `redis` is a declared dependency and still
+unused.
 
 ### The src/ layout is load-bearing
 

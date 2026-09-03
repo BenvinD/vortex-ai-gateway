@@ -29,5 +29,7 @@ This repo is the gateway (Gatewright), which owns the `0xx` range.
 | 015 | Provider failure taxonomy | typed hierarchy with a `retryable` flag, classified once in the HTTP base | let httpx errors escape; one error class with a status | Only one provider exists and every failure maps to the same status |
 | 016 | Model → provider routing | ordered `pattern=provider` glob table, first match wins | exact-name dict; regexes; provider inferred in code | Selection needs weights, fallbacks or health, not just a name |
 | 017 | Where configuration lives | environment variables, parsed at boot | JSON/YAML file; embedded DB (LiteDB/SQLite) | The table must change at runtime — then Redis, not a local file |
+| 018 | Streamed usage accounting | always ask the provider for usage; forward the chunk only if the caller asked | collect only when asked; estimate from relayed deltas | Usage reporting becomes billable, or arrives per chunk |
+| 019 | Client disconnect on a stream | let the cancellation reach the provider's generator, record the abandonment, re-raise | rely on GC; poll `receive()` for `http.disconnect` | The server never delivers a disconnect and `send()` must be relied on |
 
 Fill each row as the ADR lands. The `1xx` range belongs to the RAG repo.

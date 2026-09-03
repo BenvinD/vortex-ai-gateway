@@ -68,6 +68,39 @@ connection. They are separate because sharing a number lets an unreachable host
 hold a worker for the full generation window — measured in
 [`docs/notes/day-04.md`](docs/notes/day-04.md).
 
+### Streaming
+
+Set `"stream": true` and the reply is server-sent events in OpenAI's framing —
+`data: {chunk}` per event, terminated by `data: [DONE]`. `examples/stream.sh`
+renders the tokens as they land:
+
+```bash
+uv run uvicorn vortex_ai_gateway.gateway:app | tee gateway.log   # in one shell
+examples/stream.sh "write a haiku about latency"                 # in another
+examples/stream.sh --abandon 2                                   # hang up mid-stream
+```
+
+Two things happen behind that stream that a plain relay would not do.
+
+**Every stream is accounted for, whether or not the caller asked.** Token counts
+arrive in a final chunk providers only send when `stream_options.include_usage`
+was set, so the gateway always sets it and strips the chunk back out when the
+caller did not ask for it. The caller sees exactly the OpenAI-compatible stream
+they expect; the gateway still gets the bill, as one log line per request:
+
+```json
+{"event": "stream finished", "outcome": "completed", "provider": "openai",
+ "model": "fake-model", "upstream_model": "fake-model", "chunks": 13,
+ "prompt_tokens": 7, "completion_tokens": 12, "total_tokens": 19}
+```
+
+**Hanging up stops the meter.** When a client disconnects mid-generation the
+cancellation is carried into the provider's stream, which closes the upstream
+connection rather than leaving it generating tokens nobody will read. The
+request is recorded as `"outcome": "abandoned"` at warning level — an access log
+cannot tell that case from a stream that simply finished quickly, and it is the
+one that costs money with nothing to show for it. See ADR-018 and ADR-019.
+
 ### Running the Application
 
 ```bash
