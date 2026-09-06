@@ -14,7 +14,7 @@ This repo is the gateway (Gatewright), which owns the `0xx` range.
 |---|----------|-------|----------|-------------------------------|
 | 001 | Retry policy | branch on `retryable`, full jitter, wall-clock deadline, optional budget | fixed count for every failure; branch on HTTP status | Streams need establishing-phase retries, or a provider's `Retry-After` proves untrustworthy |
 | 002 | Breaker thresholds | one breaker per provider, single half-open trial, failures counted per request | retries alone; one breaker for the whole gateway | Fleet outgrows per-worker state — then Redis, fail-open |
-| 003 | Key storage | | | |
+| 003 | Key storage | SHA-256-hashed keys in SQLite, minted by a CLI | plaintext env list; Postgres; a `POST /v1/keys` endpoint | More than one node needs the same keys — then Postgres, same schema, same hash |
 | 004 | Streaming cache policy | | | |
 | 005 | Semantic-cache threshold/model | | | |
 | 006 | Health probe semantics | `/healthz` + `/readyz` split | single dependency-checking `/health` | Service mesh owns readiness gating itself |
@@ -32,5 +32,7 @@ This repo is the gateway (Gatewright), which owns the `0xx` range.
 | 018 | Streamed usage accounting | always ask the provider for usage; forward the chunk only if the caller asked | collect only when asked; estimate from relayed deltas | Usage reporting becomes billable, or arrives per chunk |
 | 019 | Client disconnect on a stream | let the cancellation reach the provider's generator, record the abandonment, re-raise | rely on GC; poll `receive()` for `http.disconnect` | The server never delivers a disconnect and `send()` must be relied on |
 | 020 | Provider fallback | ordered `primary>next` chains in config, hopped only on breaker-open or exhausted retries | no fallback; automatic failover on any error | Callers need one portable request across providers with different model names |
+| 021 | Per-key rate limits | RPM + TPM as one atomic Lua token bucket in Redis, fail-open | per-process counters; fixed-window `INCR` | Limits become a contractual quota — then fail closed, loudly |
+| 022 | Usage ledger | store token counts, price at read time | store dollars (float, or integer nano-USD) | Prices must be frozen per request for audit — then store both |
 
 Fill each row as the ADR lands. The `1xx` range belongs to the RAG repo.

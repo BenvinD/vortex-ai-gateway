@@ -13,25 +13,31 @@ classification has to serve the retry policy, which has no HTTP status at all.
 
 What a stream *cost* is not framing, so it is not here either:
 :mod:`~vortex_ai_gateway.streaming` owns the accounting, and this module owns
-only the decision to hand each chunk to the client.
+only the decision to hand each chunk to the client. The same applies to what a
+caller is *allowed* to spend: :mod:`~vortex_ai_gateway.metering` decides, and
+the two calls it exposes — admit before, settle after — are all this module
+knows about rate limits and ledgers.
 """
 
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 
 import structlog
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.responses import Response
 
-from vortex_ai_gateway.auth import require_api_key
+from vortex_ai_gateway.auth import Principal, require_api_key
 from vortex_ai_gateway.contracts import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ErrorDetail,
     ErrorResponse,
     ErrorType,
+    UsageReport,
 )
+from vortex_ai_gateway.metering import Meter, Reservation
 from vortex_ai_gateway.providers.base import ChatProvider
 from vortex_ai_gateway.providers.errors import (
     CircuitOpenError,
@@ -106,11 +112,19 @@ def _failure(exc: Exception) -> tuple[int, ErrorResponse]:
     )
 
 
-def create_chat_router(provider: ChatProvider) -> APIRouter:
-    """Build the ``/v1`` router served by ``provider``.
+#: How far back ``GET /v1/usage`` looks when the caller does not say. A week is
+#: long enough to see a trend and short enough to answer in one round trip per
+#: day of history.
+DEFAULT_USAGE_DAYS = 7
 
-    The provider is injected rather than looked up, so a test can mount the same
-    routes over a scripted double with no patching.
+
+def create_chat_router(provider: ChatProvider, meter: Meter) -> APIRouter:
+    """Build the ``/v1`` router served by ``provider``, metered by ``meter``.
+
+    Both are injected rather than looked up, so a test can mount the same routes
+    over a scripted double with no patching — and so a gateway with no Redis
+    gets a pass-through :class:`~vortex_ai_gateway.metering.Meter` instead of a
+    branch on every request.
     """
     # Auth is declared on the router, not per route, so a route added later
     # cannot be published unauthenticated by omission. The health probes live
@@ -134,40 +148,91 @@ def create_chat_router(provider: ChatProvider) -> APIRouter:
             504: {"model": ErrorResponse},
         },
     )
-    async def create_chat_completion(request: ChatCompletionRequest) -> Response:
+    async def create_chat_completion(
+        request: ChatCompletionRequest, http_request: Request
+    ) -> Response:
         """Serve a chat completion, streamed or whole.
 
         A streaming request cannot report a failure with a status code — the
         ``200`` is already on the wire by the time the provider breaks — so the
         two paths diverge here: a ``502`` envelope for the buffered case, an
         error event mid-stream for the other.
+
+        Admission happens before either path, and before the provider is
+        touched: the whole point of a limit is that an over-quota request costs
+        nothing upstream. Its headers ride on the response whether or not it was
+        allowed, so a caller can see their remaining allowance shrinking instead
+        of discovering it at zero.
         """
+        principal: Principal = http_request.state.principal
+        reservation = await meter.admit(principal, request)
+
         if request.stream:
             return StreamingResponse(
-                _stream_events(provider, request),
+                _stream_events(provider, request, meter, reservation),
                 media_type="text/event-stream",
-                headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Accel-Buffering": "no",
+                    **reservation.headers,
+                },
             )
 
         try:
             completion = await provider.complete(request)
         except Exception as exc:
             logger.exception("provider request failed", provider=provider.name, model=request.model)
+            await meter.discard(reservation)
             http_status, envelope = _failure(exc)
             retry_after = getattr(exc, "retry_after", None)
+            headers = dict(reservation.headers)
+            if retry_after:
+                headers["Retry-After"] = str(int(retry_after))
             return JSONResponse(
                 status_code=http_status,
                 content=envelope.model_dump(mode="json"),
-                headers={"Retry-After": str(int(retry_after))} if retry_after else None,
+                headers=headers or None,
             )
 
-        return JSONResponse(content=completion.model_dump(mode="json", exclude_none=True))
+        await meter.settle(reservation, completion.usage)
+        return JSONResponse(
+            content=completion.model_dump(mode="json", exclude_none=True),
+            headers=reservation.headers or None,
+        )
+
+    @router.get("/usage", response_model=UsageReport)
+    async def read_usage(
+        http_request: Request,
+        days: int = Query(default=DEFAULT_USAGE_DAYS, ge=1, le=365),
+    ) -> UsageReport:
+        """What the calling key has used, and what it cost.
+
+        Only ever the caller's own usage. There is no key parameter, deliberately:
+        a report that can name another key is an authorisation system, and this
+        gateway does not have one — every key is equal, so the only safe scope is
+        "yours".
+
+        With no ledger configured this answers an empty report rather than a
+        ``404``. The endpoint exists either way, so a client can be written once.
+        """
+        principal: Principal = http_request.state.principal
+        if meter.ledger is None:
+            return UsageReport(key_id=principal.key_id, start_date=_today(), end_date=_today())
+        return await meter.ledger.report(principal.key_id, days=days)
 
     return router
 
 
+def _today() -> str:
+    """The current UTC day, for a report with no ledger behind it to be about."""
+    return datetime.now(tz=UTC).strftime("%Y-%m-%d")
+
+
 async def _stream_events(
-    provider: ChatProvider, request: ChatCompletionRequest
+    provider: ChatProvider,
+    request: ChatCompletionRequest,
+    meter: Meter,
+    reservation: Reservation,
 ) -> AsyncIterator[str]:
     """Yield the SSE body for a streaming completion.
 
@@ -211,8 +276,53 @@ async def _stream_events(
 
         yield SSE_DONE
     finally:
-        # The bill first, and unconditionally: closing the upstream may itself
-        # be cancelled, and a stream that is never accounted for is the one
-        # failure this whole path exists to prevent.
+        # The bill first, and unconditionally: everything below this line may
+        # itself be cancelled, and a stream that is never accounted for is the
+        # one failure this whole path exists to prevent.
         record.log()
-        await aclose_stream(stream)
+        try:
+            await _settle_stream(meter, reservation, record)
+        finally:
+            await aclose_stream(stream)
+
+
+#: Settlements spawned off an abandoned stream, held until they finish. Without
+#: a strong reference the event loop may collect the task mid-write, which is a
+#: lost ledger entry that nothing reports.
+_PENDING_SETTLEMENTS: set[asyncio.Task[None]] = set()
+
+
+async def _settle_stream(meter: Meter, reservation: Reservation, record: StreamRecord) -> None:
+    """Release the stream's reservation and record what it actually cost.
+
+    A stream that failed before its first chunk generated nothing, so its
+    reservation comes back in full. Any other ending produced tokens — possibly
+    a number nobody has, which
+    :meth:`~vortex_ai_gateway.metering.Meter.settle` records as *unmetered*
+    rather than as free.
+
+    The abandoned case is spawned rather than awaited, and that asymmetry is the
+    whole point of this function existing. For an abandoned stream this code
+    runs inside a scope Starlette has already cancelled, where the next ``await``
+    that yields raises :class:`asyncio.CancelledError` immediately — so awaiting
+    Redis here silently loses the settlement of precisely the request that most
+    needs one: the stream nobody has a token count for, whose reservation would
+    otherwise stay held for the rest of the window. Measured, not assumed: with
+    the settlement awaited in place, an abandoned stream wrote nothing to the
+    ledger at all (docs/notes/day-07.md).
+
+    Every other ending is awaited in place, where nothing is cancelling anything
+    and the write landing before the response ends is worth having.
+    """
+    if record.chunks == 0 and record.outcome == "failed":
+        settling = meter.discard(reservation)
+    else:
+        settling = meter.settle(reservation, record.usage)
+
+    if record.outcome != "abandoned":
+        await settling
+        return
+
+    task = asyncio.ensure_future(settling)
+    _PENDING_SETTLEMENTS.add(task)
+    task.add_done_callback(_PENDING_SETTLEMENTS.discard)

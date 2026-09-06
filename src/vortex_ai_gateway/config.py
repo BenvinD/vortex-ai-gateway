@@ -52,7 +52,18 @@ class Settings(BaseSettings):
     # string rather than a set because pydantic-settings parses collection
     # types from env vars as JSON, which is a hostile format for an operator
     # typing a value into a deployment console.
+    #
+    # Superseded by `key_db_path` where one is set, and kept for the case it is
+    # actually good at: a local run, or a single-key deployment that should not
+    # need a database. A key from this list has no per-key limits and no name.
     api_keys: str = ""
+
+    # SQLite file holding hashed, revocable client keys, minted by the
+    # `vortex-keys` CLI (ADR-003). Set, it becomes the only accepted source of
+    # keys — `api_keys` is ignored rather than merged, because two allow-lists
+    # means revoking from one and still being let in by the other. Empty is the
+    # development default.
+    key_db_path: str = ""
 
     # Which provider serves which model, as an ordered, comma-separated list of
     # `pattern=provider` rules — e.g.
@@ -111,6 +122,35 @@ class Settings(BaseSettings):
     # sense between providers that answer to the same model names, since the
     # request is forwarded unchanged (ADR-020).
     fallback_chains: str = ""
+
+    # Turns on the Redis-backed rate limiter and usage ledger together. Off by
+    # default because both need Redis, and `uv run uvicorn ...` on a laptop
+    # should not: a gateway that logs a fail-open warning on every request has
+    # trained its operators to ignore the one that matters. With it on, a Redis
+    # outage still only degrades — see ADR-021.
+    metering_enabled: bool = False
+
+    # Per-key rate limits, applied when a key does not carry its own (ADR-021).
+    # Zero means unlimited, which is also what makes local development work:
+    # with no limit to enforce there is nothing to ask Redis, so a gateway with
+    # no Redis behind it never notices one is missing.
+    rate_limit_default_rpm: int = 0
+    rate_limit_default_tpm: int = 0
+
+    # What a request is assumed to cost when the caller did not say. Only the
+    # completion half is guessed — the prompt is in front of us — and the guess
+    # is reconciled against real usage the moment the request settles, so it
+    # governs how much a caller can have *in flight*, not what they are charged.
+    rate_limit_assumed_completion_tokens: int = 512
+
+    # JSON file overriding the built-in price table, as
+    # `{"gpt-4o": {"prompt": 2.5, "completion": 10.0}}` in USD per million
+    # tokens (ADR-022). Empty uses the built-in table alone.
+    price_table_path: str = ""
+
+    # How long per-key usage counters live in Redis. The ledger stores token
+    # counts per day, so this is also how far back `/v1/usage` can look.
+    usage_retention_days: int = 30
 
     @property
     def allowed_api_keys(self) -> frozenset[str]:

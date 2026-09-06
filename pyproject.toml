@@ -29,8 +29,21 @@ dev = [
     "pytest-cov>=4.1.0",
     "respx>=0.21.1",
     "pre-commit>=3.5.0",
-    "types-redis>=4.6.0",
+    # The `lua` extra pulls in lupa, so fakeredis executes the limiter's real
+    # Lua script rather than a Python re-implementation of it. A rate limiter
+    # tested against a re-implementation tests the re-implementation.
+    "fakeredis[lua]>=2.37.1",
 ]
+
+# `types-redis` is deliberately absent. redis-py ships `py.typed` from 5.0, and
+# the stub package still describes the 4.x API — installing it shadows the real
+# hints and makes mypy check the wrong surface (`aclose` "does not exist" while
+# the runtime has had it for three majors).
+
+# Key management is an operator task, not an HTTP one: minting a credential
+# over the same API it authenticates is a bootstrapping problem (ADR-003).
+[project.scripts]
+vortex-keys = "vortex_ai_gateway.cli:main"
 
 [tool.ruff]
 line-length = 100

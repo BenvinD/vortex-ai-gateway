@@ -19,7 +19,15 @@ uv run mypy src                          # strict type check (tests/ is excluded
 
 uv run pre-commit install                # enable hooks
 uv run pre-commit run --all-files
+
+uv run vortex-keys create --name ci --rpm 600 --tpm 150000   # mint a client key
+uv run vortex-keys list                  # every key, newest first
+uv run vortex-keys revoke <key_id>       # takes effect on the next request
 ```
+
+`vortex-keys` is a `[project.scripts]` entry point, so it exists only after
+`uv sync`. It reads `VORTEX_KEY_DB_PATH` (or `--db`) and never talks to the
+running gateway.
 
 CI runs the same steps in order — `uv sync --locked --no-editable`, ruff check,
 ruff format --check, mypy src, pytest -v — with `uv run --no-sync` so nothing
@@ -57,10 +65,28 @@ retries and a breaker of its own, `FallbackProvider` tries an ordered chain.
 `router.providers` holds wrappers, not adapters — reach the adapter through
 `.inner` (ADR-001, ADR-002, ADR-020).
 
-Still to come (per `pyproject.toml` and the ADR index): cost accounting on top
-of `StreamRecord`, PII guardrails, rate limiting, and Redis-backed load
-balancing. `redis` is a declared dependency and still unused — breaker state is
-per worker process until it is not.
+`auth.py` answers *who is calling* and returns a `Principal`, never a token:
+`key_id` is public, stable, and safe to put in a Redis key or a log line, which
+matters because everything downstream is keyed on it. Keys come from exactly one
+of three sources — a `keys.py` SQLite store (`VORTEX_KEY_DB_PATH`, hashed and
+revocable, minted by `vortex-keys`), the plaintext `VORTEX_API_KEYS` list, or
+development mode — never merged, because two allow-lists means revoking from one
+and still being let in by the other (ADR-003).
+
+`ratelimit.py`, `pricing.py` and `spend.py` are the metering subsystem, and
+`metering.py` is the only one `routes.py` talks to: `admit` before the provider
+is touched, then `settle` (the request produced tokens, possibly a number nobody
+has) or `discard` (it produced nothing). The limiter is a per-key RPM/TPM token
+bucket in one Lua script, because a request refused by the token bucket must not
+have already spent a request; the ledger stores integer token counts and prices
+them at read time, so a corrected price corrects the history (ADR-021, ADR-022).
+Both hang off one Redis connection and are absent together, controlled by
+`VORTEX_METERING_ENABLED` — off by default, so a local run needs no Redis. Both
+fail *open*, and Redis is deliberately not a readiness check: draining a working
+instance because the limiter is degraded turns a degradation into an outage.
+
+Still to come (per `pyproject.toml` and the ADR index): PII guardrails and
+Redis-backed load balancing. Breaker state is still per worker process.
 
 ### The src/ layout is load-bearing
 
@@ -79,7 +105,13 @@ installed copy.
 
 - mypy runs `--strict`. Add `ignore_missing_imports` overrides to
   `[tool.mypy]` only when an untyped third-party package is actually imported —
-  pre-emptive sections make mypy report unused-section errors on every run.
+  pre-emptive sections make mypy report unused-section errors on every run. The
+  same goes for stub packages: `types-redis` was removed because redis-py ships
+  `py.typed` and the stubs described the 4.x API, so mypy was checking a Redis
+  that has not existed for three major versions.
+- `fakeredis[lua]` is a dev dependency so the limiter's tests execute the real
+  Lua script through lupa. A hand-written Redis double would provide atomicity
+  for free and prove nothing about the thing under test.
 - The pre-commit ruff/mypy hooks are `repo: local` and shell out to
   `uv run --no-sync` on purpose, so hook versions match CI. The mypy hook sets
   `pass_filenames: false`; passing individual files alongside the `src` package

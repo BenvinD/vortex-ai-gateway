@@ -184,3 +184,87 @@ VORTEX_BREAKER_FAILURE_THRESHOLD=5          # failed requests, not attempts
 Retries, breaker transitions and fallback hops each emit one JSON log event
 carrying the request ID, so `event:"provider fallback"` is a single query. See
 ADR-001, ADR-002 and ADR-020 for the decisions behind the defaults.
+
+## API keys
+
+Keys live hashed in SQLite and are minted by a CLI, not an endpoint — creating
+the *first* credential over an authenticated API is a bootstrapping problem
+whose usual answer is a bootstrap secret, which is the plaintext key we were
+trying to get rid of (ADR-003).
+
+```bash
+export VORTEX_KEY_DB_PATH=/var/lib/vortex/keys.sqlite3
+
+uv run vortex-keys create --name ci-pipeline --rpm 600 --tpm 150000
+# vtx_9f2c41ab77de_qtZ8...  ← shown once; only the SHA-256 is stored
+uv run vortex-keys list
+uv run vortex-keys revoke 9f2c41ab77de     # effective on the next request
+```
+
+A token is `vtx_<key_id>_<secret>`. The `key_id` is public: it is what you
+revoke by, what appears in logs, and what a rate limit and a bill hang off. The
+secret is 32 CSPRNG bytes hashed with SHA-256 — not bcrypt, because a work
+factor exists to make *guessable* secrets expensive to guess and there is no
+dictionary behind 256 random bits, so it would buy nothing and cost ~100 ms of
+CPU on every request.
+
+With `VORTEX_KEY_DB_PATH` set, the plaintext `VORTEX_API_KEYS` list is ignored
+rather than merged: two allow-lists means revoking from one and still being let
+in by the other.
+
+## Rate limits and usage
+
+Each key gets a requests-per-minute and a tokens-per-minute allowance, held as
+token buckets in Redis and checked in a single Lua script — a request refused by
+the token bucket must not have already spent a request (ADR-021).
+
+```bash
+VORTEX_METERING_ENABLED=true
+VORTEX_REDIS_URL=redis://localhost:6379/0
+VORTEX_RATE_LIMIT_DEFAULT_RPM=60            # for keys with no limit of their own
+VORTEX_RATE_LIMIT_DEFAULT_TPM=90000         # 0 means unlimited
+VORTEX_RATE_LIMIT_ASSUMED_COMPLETION_TOKENS=512
+```
+
+Every response carries its remaining allowance, not just the rejections, so a
+client can slow down *before* it is throttled:
+
+```
+x-ratelimit-limit-requests: 60      x-ratelimit-limit-tokens: 90000
+x-ratelimit-remaining-requests: 59  x-ratelimit-remaining-tokens: 89498
+x-ratelimit-reset-requests: 1.0s    x-ratelimit-reset-tokens: 0.3s
+```
+
+A rejection is a `429` with `Retry-After` and `"code": "gateway_rate_limit_exceeded"`,
+which is how it is told apart from a `429` relayed from a vendor — one means a
+client is sending too much, the other means our own account is throttled.
+
+Because a request's token cost is unknown until the provider answers, admission
+reserves an estimate and settlement reconciles it against real usage. Redis
+being unreachable **fails open** with one warning, and Redis is deliberately not
+a readiness check: draining a working instance because the limiter is degraded
+would turn a degradation into an outage.
+
+`GET /v1/usage` reports the calling key's own spend, priced from a table you can
+override without a release:
+
+```bash
+curl -H "Authorization: Bearer $KEY" localhost:8000/v1/usage?days=7
+```
+
+```json
+{"object": "usage.report", "key_id": "9f2c41ab77de",
+ "total_requests": 5, "total_unmetered_requests": 0, "total_tokens": 35,
+ "total_cost_usd": "0.0000165", "unpriced_models": [], "daily": [...]}
+```
+
+The ledger stores **token counts**, never money: `HINCRBY` is exact, and pricing
+at read time means a corrected price corrects the history rather than needing a
+migration. Costs come back as JSON *strings* so they survive a round trip
+through a parser that would otherwise make them floats. A model the table cannot
+price reports `null`, never zero, and names itself in `unpriced_models` — and a
+request whose usage never arrived (an abandoned stream) is counted as
+*unmetered* rather than as free. `VORTEX_PRICE_TABLE_PATH` points at
+`{"gpt-4o": {"prompt": 2.5, "completion": 10.0}}` in USD per million tokens; it
+is consulted before the built-in table, so it need only name what it corrects.
+See ADR-022.

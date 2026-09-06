@@ -6,6 +6,8 @@ here, so a client only ever has to parse
 the app in one place rather than scattered across routers.
 """
 
+from collections.abc import Mapping
+
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -23,6 +25,12 @@ class GatewayError(Exception):
     Raised from dependencies and routes where returning a response is awkward
     (a dependency cannot return one). The handler below renders it; nothing
     else needs to know how the envelope is shaped.
+
+    ``headers`` carries the part of a rejection that is not the body. A ``401``
+    is unusable without ``WWW-Authenticate`` and a ``429`` is unusable without
+    ``Retry-After``: in both cases the header is what tells the client what to
+    *do*, so it belongs on the exception beside the message rather than being
+    reattached by whoever catches it.
     """
 
     def __init__(
@@ -33,10 +41,12 @@ class GatewayError(Exception):
         error_type: ErrorType,
         param: str | None = None,
         code: str | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.detail = ErrorDetail(message=message, type=error_type, param=param, code=code)
+        self.headers = dict(headers) if headers else {}
 
 
 class AuthenticationError(GatewayError):
@@ -48,6 +58,27 @@ class AuthenticationError(GatewayError):
             status_code=status.HTTP_401_UNAUTHORIZED,
             error_type="authentication_error",
             code=code,
+            # Without this a client cannot tell "wrong key" from "wrong URL".
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+class RateLimitedError(GatewayError):
+    """The caller is over one of their own limits — not a provider's (ADR-021).
+
+    A ``429`` from the gateway and a ``429`` relayed from a vendor mean opposite
+    things to whoever is paged: one is a client sending too much, the other is
+    the gateway's own account being throttled. They are the same status, so the
+    difference has to live in ``code``.
+    """
+
+    def __init__(self, message: str, *, code: str, headers: Mapping[str, str]) -> None:
+        super().__init__(
+            message,
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            error_type="rate_limit_error",
+            code=code,
+            headers=headers,
         )
 
 
@@ -70,14 +101,9 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(GatewayError)
     async def handle_gateway_error(request: Request, exc: GatewayError) -> JSONResponse:
-        """Render a deliberate failure at the status the raiser chose."""
-        headers = (
-            {"WWW-Authenticate": "Bearer"}
-            if exc.status_code == status.HTTP_401_UNAUTHORIZED
-            else None
-        )
+        """Render a deliberate failure at the status, and with the headers, the raiser chose."""
         return JSONResponse(
             status_code=exc.status_code,
             content={"error": exc.detail.model_dump(mode="json")},
-            headers=headers,
+            headers=exc.headers or None,
         )

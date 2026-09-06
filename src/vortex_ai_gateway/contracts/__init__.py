@@ -14,6 +14,7 @@ Layering::
     usage      token accounting and log probabilities
     chat       ChatCompletionRequest / Response / Chunk
     catalog    model listing
+    spend      the per-key usage report (gateway-native, not OpenAI-shaped)
     errors     the error envelope and the pydantic -> envelope translation
 
 Import from this package rather than the submodules; the split is an
@@ -72,6 +73,7 @@ from vortex_ai_gateway.contracts.options import (
     StreamOptions,
     TextResponseFormat,
 )
+from vortex_ai_gateway.contracts.spend import DailyUsage, ModelUsage, UsageReport
 from vortex_ai_gateway.contracts.tools import (
     FunctionDefinition,
     NamedToolChoice,
@@ -101,6 +103,7 @@ __all__ = [
     "ChoiceLogprobs",
     "CompletionTokensDetails",
     "ContractModel",
+    "DailyUsage",
     "DeveloperMessage",
     "ErrorDetail",
     "ErrorResponse",
@@ -121,6 +124,7 @@ __all__ = [
     "MessageAnnotation",
     "ModelCard",
     "ModelList",
+    "ModelUsage",
     "NamedToolChoice",
     "NamedToolFunction",
     "NonEmptyStr",
@@ -145,6 +149,7 @@ __all__ = [
     "TopLogprob",
     "UnixTimestamp",
     "UrlCitation",
+    "UsageReport",
     "UserContentPart",
     "UserMessage",
     "error_response_from_validation_error",
