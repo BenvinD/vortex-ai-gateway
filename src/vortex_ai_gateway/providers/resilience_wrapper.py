@@ -56,8 +56,8 @@ class ResilientProvider:
 
             try:
                 result = await self.inner.complete(request)
-            except BaseException as exc:
-                # Cancellation or keyboard interrupt: release any reserved half-open slot
+            except asyncio.CancelledError:
+                # Cancellation: release any reserved half-open slot and propagate
                 await self.breaker.release_trial()
                 raise
             except Exception as exc:
