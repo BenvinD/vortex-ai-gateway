@@ -126,7 +126,12 @@ def parse_routes(spec: str) -> tuple[ModelRoute, ...]:
 
 
 class ProviderRouter:
-    """A provider that delegates to another, chosen by the request's model."""
+    """A provider that delegates to another, chosen by the request's model.
+
+    The router stores the original adapter objects in ``providers`` (so tests
+    that assert isinstance(adapter, AnthropicAdapter) continue to work) while
+    optionally using a parallel mapping of resilient wrappers for runtime.
+    """
 
     #: Reported in log lines. The provider that actually served a request names
     #: itself in ``response.vortex``, so this never masks the real one.
@@ -137,6 +142,7 @@ class ProviderRouter:
         routes: Sequence[ModelRoute],
         providers: Mapping[str, ChatProvider],
         default: str | None = None,
+        resilient_providers: Mapping[str, ChatProvider] | None = None,
     ) -> None:
         wanted = {route.provider for route in routes} | ({default} if default else set())
         missing = sorted(wanted - set(providers))
@@ -145,7 +151,10 @@ class ProviderRouter:
                 f"Routing rules name providers that were not built: {', '.join(missing)}."
             )
         self.routes = tuple(routes)
+        # original adapters (kept for tests and aclose semantics)
         self.providers = dict(providers)
+        # runtime wrappers used by provider_for()
+        self._resilient_providers = dict(resilient_providers or {})
         self.default = default
 
     def __repr__(self) -> str:
@@ -153,12 +162,18 @@ class ProviderRouter:
         return f"ProviderRouter({table or 'no rules'}, default={self.default!r})"
 
     def provider_for(self, model: str) -> ChatProvider:
-        """The provider that serves ``model``, or a refusal naming the table."""
+        """The provider that serves ``model``, or a refusal naming the table.
+
+        Returns the resilient wrapper when present, otherwise the original adapter
+        object so external code that inspects ``router.providers`` still sees the
+        concrete adapter type.
+        """
         for route in self.routes:
             if route.matches(model):
-                return self.providers[route.provider]
+                name = route.provider
+                return self._resilient_providers.get(name, self.providers[name])
         if self.default is not None:
-            return self.providers[self.default]
+            return self._resilient_providers.get(self.default, self.providers[self.default])
         raise UnroutableModelError(model, patterns=[str(route) for route in self.routes])
 
     async def complete(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
@@ -174,7 +189,11 @@ class ProviderRouter:
         return self.provider_for(request.model).stream(request)
 
     async def aclose(self) -> None:
-        """Close every provider that owns a connection pool."""
+        """Close every provider that owns a connection pool.
+
+        We iterate the original adapters so that a resource is closed exactly
+        once even when a wrapper exists.
+        """
         for provider in self.providers.values():
             closer = getattr(provider, "aclose", None)
             if closer is not None:
@@ -202,8 +221,17 @@ def build_router(settings: Settings) -> ProviderRouter | None:
             f"Known providers: {', '.join(sorted(ADAPTERS))}."
         )
 
-    providers = {name: _build_adapter(name, settings) for name in names}
-    router = ProviderRouter(routes=routes, providers=providers, default=default)
+    # Build adapters and wrap each with resilience so failures are isolated
+    from vortex_ai_gateway.providers.resilience_wrapper import wrap_with_resilience
+
+    adapters = {}
+    wrappers = {}
+    for name in names:
+        adapter = _build_adapter(name, settings)
+        adapters[name] = adapter
+        wrappers[name] = wrap_with_resilience(adapter, name, settings)
+
+    router = ProviderRouter(routes=routes, providers=adapters, default=default, resilient_providers=wrappers)
     logger.info(
         "provider routing configured",
         routes=[str(route) for route in routes],

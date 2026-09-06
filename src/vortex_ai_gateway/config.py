@@ -80,6 +80,20 @@ class Settings(BaseSettings):
     ollama_api_key: str = ""
     ollama_base_url: str = ""
 
+    # Resilience settings (per-provider)
+    retry_max_attempts: int = 3
+    retry_backoff_seconds: float = 0.5
+    retry_max_backoff_seconds: float = 10.0
+
+    breaker_failure_threshold: int = 5
+    breaker_reset_seconds: float = 60.0
+    breaker_backoff_multiplier: float = 2.0
+    breaker_max_open_seconds: float = 600.0
+
+    # Optional retry budget settings (0 disables the budget)
+    retry_budget_capacity: int = 0
+    retry_budget_refill_per_second: float = 0.0
+
     @property
     def allowed_api_keys(self) -> frozenset[str]:
         """The accepted client keys, empty when the gateway is left open.

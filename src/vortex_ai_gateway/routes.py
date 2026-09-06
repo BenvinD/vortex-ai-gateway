@@ -39,6 +39,7 @@ from vortex_ai_gateway.providers.errors import (
     ProviderError,
     ProviderRateLimited,
     ProviderTimeout,
+    ProviderUnavailable,
 )
 from vortex_ai_gateway.routing import UnroutableModelError
 from vortex_ai_gateway.streaming import StreamRecord, aclose_stream, metered, wants_usage
@@ -61,6 +62,7 @@ FAILURE_STATUSES: tuple[tuple[type[ProviderError], int, ErrorType], ...] = (
     (ProviderBadRequest, status.HTTP_400_BAD_REQUEST, "invalid_request_error"),
     (ProviderRateLimited, status.HTTP_429_TOO_MANY_REQUESTS, "rate_limit_error"),
     (ProviderTimeout, status.HTTP_504_GATEWAY_TIMEOUT, "api_error"),
+    (ProviderUnavailable, status.HTTP_503_SERVICE_UNAVAILABLE, "api_error"),
     (ProviderAuthError, status.HTTP_502_BAD_GATEWAY, "api_error"),
 )
 
