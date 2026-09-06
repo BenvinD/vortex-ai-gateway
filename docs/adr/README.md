@@ -12,8 +12,8 @@ This repo is the gateway (Gatewright), which owns the `0xx` range.
 
 | # | Decision | Chose | Rejected | When the rejected option wins |
 |---|----------|-------|----------|-------------------------------|
-| 001 | Retry policy | | | |
-| 002 | Breaker thresholds | | | |
+| 001 | Retry policy | branch on `retryable`, full jitter, wall-clock deadline, optional budget | fixed count for every failure; branch on HTTP status | Streams need establishing-phase retries, or a provider's `Retry-After` proves untrustworthy |
+| 002 | Breaker thresholds | one breaker per provider, single half-open trial, failures counted per request | retries alone; one breaker for the whole gateway | Fleet outgrows per-worker state — then Redis, fail-open |
 | 003 | Key storage | | | |
 | 004 | Streaming cache policy | | | |
 | 005 | Semantic-cache threshold/model | | | |
@@ -31,5 +31,6 @@ This repo is the gateway (Gatewright), which owns the `0xx` range.
 | 017 | Where configuration lives | environment variables, parsed at boot | JSON/YAML file; embedded DB (LiteDB/SQLite) | The table must change at runtime — then Redis, not a local file |
 | 018 | Streamed usage accounting | always ask the provider for usage; forward the chunk only if the caller asked | collect only when asked; estimate from relayed deltas | Usage reporting becomes billable, or arrives per chunk |
 | 019 | Client disconnect on a stream | let the cancellation reach the provider's generator, record the abandonment, re-raise | rely on GC; poll `receive()` for `http.disconnect` | The server never delivers a disconnect and `send()` must be relied on |
+| 020 | Provider fallback | ordered `primary>next` chains in config, hopped only on breaker-open or exhausted retries | no fallback; automatic failover on any error | Callers need one portable request across providers with different model names |
 
 Fill each row as the ADR lands. The `1xx` range belongs to the RAG repo.

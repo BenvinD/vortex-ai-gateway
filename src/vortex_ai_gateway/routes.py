@@ -34,12 +34,12 @@ from vortex_ai_gateway.contracts import (
 )
 from vortex_ai_gateway.providers.base import ChatProvider
 from vortex_ai_gateway.providers.errors import (
+    CircuitOpenError,
     ProviderAuthError,
     ProviderBadRequest,
     ProviderError,
     ProviderRateLimited,
     ProviderTimeout,
-    ProviderUnavailable,
 )
 from vortex_ai_gateway.routing import UnroutableModelError
 from vortex_ai_gateway.streaming import StreamRecord, aclose_stream, metered, wants_usage
@@ -53,6 +53,9 @@ SSE_DONE = "data: [DONE]\n\n"
 #: How each provider failure is reported. Checked in order, so a subclass may
 #: precede its parent; anything unmatched is a ``502``.
 #:
+#: ``CircuitOpenError`` is the one status the gateway raises about *itself*: a
+#: ``503`` with ``Retry-After``, because no call was made at all.
+#:
 #: Two of these are deliberate refusals to pass the upstream status through.
 #: A ``401`` from a vendor means *our* key is wrong, so reporting ``401`` would
 #: tell the caller to fix a key that is perfectly good; and an upstream timeout
@@ -62,7 +65,7 @@ FAILURE_STATUSES: tuple[tuple[type[ProviderError], int, ErrorType], ...] = (
     (ProviderBadRequest, status.HTTP_400_BAD_REQUEST, "invalid_request_error"),
     (ProviderRateLimited, status.HTTP_429_TOO_MANY_REQUESTS, "rate_limit_error"),
     (ProviderTimeout, status.HTTP_504_GATEWAY_TIMEOUT, "api_error"),
-    (ProviderUnavailable, status.HTTP_503_SERVICE_UNAVAILABLE, "api_error"),
+    (CircuitOpenError, status.HTTP_503_SERVICE_UNAVAILABLE, "api_error"),
     (ProviderAuthError, status.HTTP_502_BAD_GATEWAY, "api_error"),
 )
 

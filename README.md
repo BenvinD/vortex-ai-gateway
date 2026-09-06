@@ -164,3 +164,23 @@ The `main` branch requires these checks to pass and a pull request review.
 ## License
 
 Licensed under the Apache License 2.0. See LICENSE file for details.
+
+## Resilience
+
+Every provider gets its own retry loop and its own circuit breaker, so one
+vendor's outage cannot stop another's traffic. Failures are classified by the
+taxonomy in `providers/errors.py`: transient ones are retried with full jitter
+inside a wall-clock deadline, a `429` waits exactly as long as the provider
+asked, and a `400` is never retried and never counts against the breaker.
+
+```bash
+VORTEX_MODEL_ROUTES=gpt-*=openai,claude-*=anthropic
+VORTEX_FALLBACK_CHAINS=openai>anthropic     # hop when openai's breaker is open
+VORTEX_RETRY_MAX_ATTEMPTS=3
+VORTEX_RETRY_DEADLINE_SECONDS=90            # must exceed the request timeout
+VORTEX_BREAKER_FAILURE_THRESHOLD=5          # failed requests, not attempts
+```
+
+Retries, breaker transitions and fallback hops each emit one JSON log event
+carrying the request ID, so `event:"provider fallback"` is a single query. See
+ADR-001, ADR-002 and ADR-020 for the decisions behind the defaults.

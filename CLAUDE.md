@@ -49,10 +49,18 @@ requested, strips the usage chunk back out when the caller did not ask
 including the abandoned ones, where the client hung up and the cancellation was
 carried into the provider's generator to close the upstream (ADR-019).
 
+`resilience.py` holds provider-agnostic primitives — retry policy, token-bucket
+retry budget, circuit breaker — and `providers/resilience_wrapper.py` composes
+them through the `ChatProvider` seam: `ResilientProvider` wraps one adapter with
+retries and a breaker of its own, `FallbackProvider` tries an ordered chain.
+`build_router` wraps every adapter before the router sees it, so
+`router.providers` holds wrappers, not adapters — reach the adapter through
+`.inner` (ADR-001, ADR-002, ADR-020).
+
 Still to come (per `pyproject.toml` and the ADR index): cost accounting on top
-of `StreamRecord`, retries and circuit breaking, PII guardrails, rate limiting,
-and Redis-backed load balancing. `redis` is a declared dependency and still
-unused.
+of `StreamRecord`, PII guardrails, rate limiting, and Redis-backed load
+balancing. `redis` is a declared dependency and still unused — breaker state is
+per worker process until it is not.
 
 ### The src/ layout is load-bearing
 

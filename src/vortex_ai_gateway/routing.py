@@ -43,6 +43,10 @@ from vortex_ai_gateway.providers import (
     OpenAIAdapter,
     ProviderBadRequest,
 )
+from vortex_ai_gateway.providers.resilience_wrapper import (
+    FallbackProvider,
+    wrap_with_resilience,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -82,6 +86,34 @@ class UnroutableModelError(ProviderBadRequest):
             code="model_not_found",
         )
         self.model = model
+
+
+def parse_fallback_chains(spec: str) -> dict[str, tuple[str, ...]]:
+    """Parse ``"openai>anthropic,anthropic>ollama"`` into chains by head.
+
+    Each chain is ordered and keyed on its first provider, which is the one a
+    routing rule names. Whitespace is ignored so the value survives being
+    wrapped across lines in a deployment manifest, as ``parse_routes`` does.
+    """
+    chains: dict[str, tuple[str, ...]] = {}
+    for entry in spec.split(","):
+        rule = entry.strip()
+        if not rule:
+            continue
+        members = tuple(part.strip() for part in rule.split(">"))
+        if len(members) < 2 or not all(members):
+            raise RoutingConfigError(
+                f"Fallback chain {rule!r} is not 'primary>next[>next]'; "
+                "for example 'openai>anthropic'."
+            )
+        if len(set(members)) != len(members):
+            raise RoutingConfigError(
+                f"Fallback chain {rule!r} names a provider twice; a chain must not loop."
+            )
+        if members[0] in chains:
+            raise RoutingConfigError(f"Provider {members[0]!r} heads more than one fallback chain.")
+        chains[members[0]] = members
+    return chains
 
 
 @dataclass(frozen=True)
@@ -128,9 +160,12 @@ def parse_routes(spec: str) -> tuple[ModelRoute, ...]:
 class ProviderRouter:
     """A provider that delegates to another, chosen by the request's model.
 
-    The router stores the original adapter objects in ``providers`` (so tests
-    that assert isinstance(adapter, AnthropicAdapter) continue to work) while
-    optionally using a parallel mapping of resilient wrappers for runtime.
+    ``providers`` holds whatever was built for each name — in a configured
+    deployment a :class:`~vortex_ai_gateway.providers.resilience_wrapper.ResilientProvider`
+    or a :class:`~vortex_ai_gateway.providers.resilience_wrapper.FallbackProvider`
+    around the adapter. One mapping, not two: a parallel "real" mapping kept
+    only so tests can assert on adapter types is bookkeeping nobody enforces,
+    and the wrappers expose ``.inner`` for anything that needs the adapter.
     """
 
     #: Reported in log lines. The provider that actually served a request names
@@ -142,7 +177,6 @@ class ProviderRouter:
         routes: Sequence[ModelRoute],
         providers: Mapping[str, ChatProvider],
         default: str | None = None,
-        resilient_providers: Mapping[str, ChatProvider] | None = None,
     ) -> None:
         wanted = {route.provider for route in routes} | ({default} if default else set())
         missing = sorted(wanted - set(providers))
@@ -151,10 +185,7 @@ class ProviderRouter:
                 f"Routing rules name providers that were not built: {', '.join(missing)}."
             )
         self.routes = tuple(routes)
-        # original adapters (kept for tests and aclose semantics)
         self.providers = dict(providers)
-        # runtime wrappers used by provider_for()
-        self._resilient_providers = dict(resilient_providers or {})
         self.default = default
 
     def __repr__(self) -> str:
@@ -162,18 +193,12 @@ class ProviderRouter:
         return f"ProviderRouter({table or 'no rules'}, default={self.default!r})"
 
     def provider_for(self, model: str) -> ChatProvider:
-        """The provider that serves ``model``, or a refusal naming the table.
-
-        Returns the resilient wrapper when present, otherwise the original adapter
-        object so external code that inspects ``router.providers`` still sees the
-        concrete adapter type.
-        """
+        """The provider that serves ``model``, or a refusal naming the table."""
         for route in self.routes:
             if route.matches(model):
-                name = route.provider
-                return self._resilient_providers.get(name, self.providers[name])
+                return self.providers[route.provider]
         if self.default is not None:
-            return self._resilient_providers.get(self.default, self.providers[self.default])
+            return self.providers[self.default]
         raise UnroutableModelError(model, patterns=[str(route) for route in self.routes])
 
     async def complete(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
@@ -191,8 +216,8 @@ class ProviderRouter:
     async def aclose(self) -> None:
         """Close every provider that owns a connection pool.
 
-        We iterate the original adapters so that a resource is closed exactly
-        once even when a wrapper exists.
+        Wrappers delegate to what they hold, and a chain closes each member, so
+        every adapter is reached exactly once through the mapping.
         """
         for provider in self.providers.values():
             closer = getattr(provider, "aclose", None)
@@ -203,40 +228,60 @@ class ProviderRouter:
 def build_router(settings: Settings) -> ProviderRouter | None:
     """Build the router described by ``settings``, or ``None`` if unconfigured.
 
-    Only the providers the table actually names are constructed, so an
-    unrelated missing key cannot stop the gateway booting — and a *named*
-    provider missing its key stops it immediately, rather than turning into a
-    ``401`` on the first request that routes there.
+    Only the providers the table actually names are constructed — plus anything
+    named as a fallback for one of them — so an unrelated missing key cannot
+    stop the gateway booting, while a *named* provider missing its key stops it
+    immediately rather than turning into a ``401`` on the first request that
+    routes there.
+
+    Every adapter is wrapped in its own retry loop and its own breaker before
+    anything else sees it, so one vendor's outage cannot open another vendor's
+    circuit (ADR-002). Where a fallback chain names it, the wrapped providers
+    are then composed into a chain (ADR-020).
     """
     routes = parse_routes(settings.model_routes)
     default = settings.default_provider.strip() or None
     if not routes and default is None:
         return None
 
-    names = sorted({route.provider for route in routes} | ({default} if default else set()))
+    chains = parse_fallback_chains(settings.fallback_chains)
+    routed = {route.provider for route in routes} | ({default} if default else set())
+    # A fallback member has to be built and key-checked like any other provider,
+    # so it joins the enable list.
+    wanted = set(routed)
+    for head in routed & set(chains):
+        wanted.update(chains[head])
+    names = sorted(wanted)
+
     unknown = [name for name in names if name not in ADAPTERS]
     if unknown:
         raise RoutingConfigError(
-            f"Unknown provider(s) in VORTEX_MODEL_ROUTES: {', '.join(unknown)}. "
-            f"Known providers: {', '.join(sorted(ADAPTERS))}."
+            f"Unknown provider(s) in VORTEX_MODEL_ROUTES or VORTEX_FALLBACK_CHAINS: "
+            f"{', '.join(unknown)}. Known providers: {', '.join(sorted(ADAPTERS))}."
+        )
+    unreachable = sorted(set(chains) - routed)
+    if unreachable:
+        raise RoutingConfigError(
+            f"Fallback chain(s) head a provider no routing rule sends traffic to: "
+            f"{', '.join(unreachable)}. Add a rule to VORTEX_MODEL_ROUTES or drop the chain."
         )
 
-    # Build adapters and wrap each with resilience so failures are isolated
-    from vortex_ai_gateway.providers.resilience_wrapper import wrap_with_resilience
+    resilient = {
+        name: wrap_with_resilience(_build_adapter(name, settings), settings) for name in names
+    }
+    providers: dict[str, ChatProvider] = dict(resilient)
+    for head, members in chains.items():
+        providers[head] = FallbackProvider([resilient[member] for member in members], name=head)
 
-    adapters = {}
-    wrappers = {}
-    for name in names:
-        adapter = _build_adapter(name, settings)
-        adapters[name] = adapter
-        wrappers[name] = wrap_with_resilience(adapter, name, settings)
-
-    router = ProviderRouter(routes=routes, providers=adapters, default=default, resilient_providers=wrappers)
+    router = ProviderRouter(routes=routes, providers=providers, default=default)
     logger.info(
         "provider routing configured",
         routes=[str(route) for route in routes],
         default_provider=default,
         providers=names,
+        fallback_chains=[" > ".join(members) for members in chains.values()],
+        retry_max_attempts=settings.retry_max_attempts,
+        breaker_failure_threshold=settings.breaker_failure_threshold,
     )
     return router
 

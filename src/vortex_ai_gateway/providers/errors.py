@@ -17,6 +17,7 @@ Error                        Retryable  Raised for
 :class:`ProviderBadRequest`  no         ``4xx``, or a request we cannot send
 :class:`ProviderAuthError`   no         ``401``/``403`` — *our* credentials
 :class:`ProviderProtocolError` no       an answer we cannot read
+:class:`CircuitOpenError`    no         we declined to call at all
 ===========================  =========  ===================================
 
 The four in the middle of that table are the ones a retry loop branches on.
@@ -140,3 +141,30 @@ class ProviderProtocolError(ProviderError):
     vendor's wire format, and the same request reproduces it exactly. The fix
     belongs in ``contracts/``.
     """
+
+
+class CircuitOpenError(ProviderError):
+    """The gateway refused to call a provider whose breaker is open.
+
+    Distinct from :class:`ProviderUnavailable` on purpose. That one means *the
+    upstream answered badly or not at all*, which is a ``502``; this one means
+    *we declined to ask*, which is a ``503`` — the gateway is deliberately
+    shedding load, and the caller can be told exactly when to come back
+    (ADR-002).
+
+    Not retryable: the breaker exists to stop calls, so retrying inside the
+    open window is the one thing that must not happen.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str,
+        retry_after: float | None = None,
+        code: str | None = "circuit_open",
+    ) -> None:
+        super().__init__(message, provider=provider, code=code)
+        #: Seconds until the breaker next admits a trial call, when known.
+        #: ``routes.py`` turns this into the ``Retry-After`` header.
+        self.retry_after = retry_after

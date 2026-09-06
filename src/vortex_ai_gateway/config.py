@@ -80,19 +80,37 @@ class Settings(BaseSettings):
     ollama_api_key: str = ""
     ollama_base_url: str = ""
 
-    # Resilience settings (per-provider)
+    # How a failed upstream call is retried (ADR-001). Applied per provider.
     retry_max_attempts: int = 3
     retry_backoff_seconds: float = 0.5
     retry_max_backoff_seconds: float = 10.0
 
+    # Wall-clock budget for one request including all its retries. Must exceed
+    # `request_timeout_seconds`, or the first slow failure spends the whole
+    # budget and `retry_max_attempts` silently means one — which is precisely
+    # what happens for timeouts, the failure most worth retrying.
+    retry_deadline_seconds: float = 90.0
+
+    # Retry budget: caps retries in aggregate rather than per request, so an
+    # outage cannot turn every client's retries into a load multiplier against
+    # a recovering provider. Zero capacity disables it.
+    retry_budget_capacity: int = 0
+    retry_budget_refill_per_second: float = 0.0
+
+    # Circuit breaker, one per provider (ADR-002). `breaker_reset_seconds` is
+    # the first open window; each reopen multiplies it up to the maximum.
     breaker_failure_threshold: int = 5
     breaker_reset_seconds: float = 60.0
     breaker_backoff_multiplier: float = 2.0
     breaker_max_open_seconds: float = 600.0
 
-    # Optional retry budget settings (0 disables the budget)
-    retry_budget_capacity: int = 0
-    retry_budget_refill_per_second: float = 0.0
+    # Ordered fallback chains, comma-separated, as `primary>next>last` — e.g.
+    #     openai>anthropic,anthropic>ollama
+    # A request routed to `primary` tries the rest of its chain when that
+    # provider's breaker is open or it exhausts its retries. Chains only make
+    # sense between providers that answer to the same model names, since the
+    # request is forwarded unchanged (ADR-020).
+    fallback_chains: str = ""
 
     @property
     def allowed_api_keys(self) -> frozenset[str]:

@@ -22,6 +22,7 @@ from vortex_ai_gateway.providers import (
     OllamaAdapter,
     OpenAIAdapter,
 )
+from vortex_ai_gateway.providers.resilience_wrapper import ResilientProvider
 from vortex_ai_gateway.routing import (
     ModelRoute,
     ProviderRouter,
@@ -211,7 +212,11 @@ def test_adapters_are_built_from_the_matching_settings() -> None:
     )
 
     assert router is not None
-    adapter = router.providers["anthropic"]
+    # Every provider is wrapped in its own retry loop and breaker before the
+    # router sees it; `.inner` is the adapter that wrapper holds.
+    wrapped = router.providers["anthropic"]
+    assert isinstance(wrapped, ResilientProvider)
+    adapter = wrapped.inner
     assert isinstance(adapter, AnthropicAdapter)
     assert adapter.api_key == "sk-ant-test"
     assert adapter.base_url == "https://anthropic.internal"
@@ -229,7 +234,9 @@ def test_a_local_runtime_needs_no_key() -> None:
     router = build_router(settings_with(model_routes="local/*=ollama"))
 
     assert router is not None
-    assert isinstance(router.providers["ollama"], OllamaAdapter)
+    wrapped = router.providers["ollama"]
+    assert isinstance(wrapped, ResilientProvider)
+    assert isinstance(wrapped.inner, OllamaAdapter)
 
 
 def test_an_unknown_provider_name_is_rejected_with_the_known_ones() -> None:

@@ -66,7 +66,7 @@ async def test_a_provider_the_factory_built_is_closed_on_shutdown() -> None:
     settings = Settings(_env_file=None, model_routes="local/*=ollama")
     app = create_app(settings=settings)
     router = app.state.provider
-    opened = [adapter.client for adapter in router.providers.values()]
+    opened = [wrapped.inner.client for wrapped in router.providers.values()]
 
     async with app.router.lifespan_context(app):
         assert not any(client.is_closed for client in opened)
