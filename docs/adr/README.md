@@ -34,5 +34,6 @@ This repo is the gateway (Gatewright), which owns the `0xx` range.
 | 020 | Provider fallback | ordered `primary>next` chains in config, hopped only on breaker-open or exhausted retries | no fallback; automatic failover on any error | Callers need one portable request across providers with different model names |
 | 021 | Per-key rate limits | RPM + TPM as one atomic Lua token bucket in Redis, fail-open | per-process counters; fixed-window `INCR` | Limits become a contractual quota — then fail closed, loudly |
 | 022 | Usage ledger | store token counts, price at read time | store dollars (float, or integer nano-USD) | Prices must be frozen per request for audit — then store both |
+| 023 | Agent tooling in the repo | committed hooks/skills that shell out to CI's own tools | nothing in-repo; commit personal prefs too | Hooks become personal preference rather than repo policy |
 
 Fill each row as the ADR lands. The `1xx` range belongs to the RAG repo.

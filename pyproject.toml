@@ -45,6 +45,15 @@ dev = [
 [project.scripts]
 vortex-keys = "vortex_ai_gateway.cli:main"
 
+# The per-directory agent instruction files are guidance for whoever edits this
+# tree, not part of what the gateway ships. Hatchling includes every file under
+# the package directory, so without this `providers/CLAUDE.md` lands in the
+# site-packages of anyone who installs the wheel (ADR-023). Only `exclude` is
+# set here on purpose — naming `packages` would replace hatchling's src/
+# auto-detection with a list to keep in step by hand.
+[tool.hatch.build.targets.wheel]
+exclude = ["**/CLAUDE.md", "**/AGENTS.md"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py314"

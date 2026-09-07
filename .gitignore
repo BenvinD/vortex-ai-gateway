@@ -49,3 +49,8 @@ htmlcov/
 .env
 .env.*
 !.env.example
+
+# Agent tooling. .claude/settings.json, hooks/, skills/ and agents/ are
+# committed on purpose (ADR-023) — they are repo policy. Personal overrides
+# and machine-local state are not.
+.claude/settings.local.json
