@@ -17,6 +17,7 @@ import pytest
 from fakeredis import aioredis
 from fastapi.testclient import TestClient
 
+from tests.test_spend import Clock
 from tests.test_streaming import EndlessProvider, body, scope_for
 from vortex_ai_gateway.auth import Principal
 from vortex_ai_gateway.config import Settings
@@ -59,9 +60,17 @@ def build(
         metering_enabled=True,
         **overrides,
     )
-    return TestClient(
-        create_app(settings=settings, provider=provider or MockProvider(), redis=redis)
-    )
+    app = create_app(settings=settings, provider=provider or MockProvider(), redis=redis)
+    # The bucket refills against the clock, and these tests assert on exact
+    # bucket arithmetic. At tpm=10_000 the refill is ~167 tokens a second, so
+    # two requests a few milliseconds apart leave the bucket a token or two
+    # above where the debits alone put it — which reads as "the refund was
+    # short by one" and is invisible on a fast laptop. Pinning the clock is the
+    # same fix `tests/test_spend.py` applies to the ledger, and for the same
+    # reason: a loaded CI runner refills more than a developer's machine does.
+    if app.state.meter.limiter is not None:
+        app.state.meter.limiter = RateLimiter(redis, clock=Clock())
+    return TestClient(app)
 
 
 def auth(token: str) -> dict[str, str]:

@@ -42,9 +42,9 @@ uv run --no-sync pytest -q --no-cov -x tests/test_<file>.py
 
 Coverage runs once at the end, via `/verify`.
 
-## The two failure classes that got through 541 passing tests
+## The three failure classes that got through 541 passing tests
 
-Both from `docs/notes/day-07.md`.
+The first two from `docs/notes/day-07.md`; the third from a CI-only failure.
 
 **A test that samples randomness once is a coin flip.** `parse_key_id` failed on
 48.3% of minted keys; the test minting *one* key failed half its runs and read
@@ -60,5 +60,12 @@ failed, **abandoned** — and the abandoned one runs its `finally` inside an
 already-cancelled scope where the next yielding `await` raises `CancelledError`
 immediately. When testing anything a stream touches, cover all three endings
 with that subsystem live; parametrise over them rather than sharing a default.
+
+**A test that reads the wall clock fails on a busy runner.** The token bucket
+refills by `(now - seen) * rate` — ~167 tokens a second at `tpm=10_000` — so an
+exact assertion on bucket movement passed locally and failed in CI by one token.
+`RateLimiter` and `SpendLedger` both take `clock=` precisely so a test can pin
+it; `ratelimit.py` says a limiter that reads the clock itself "cannot be driven
+by a test". Pin the clock whenever an assertion is time-derived.
 
 Use the `add-tests` skill for the full checklist.

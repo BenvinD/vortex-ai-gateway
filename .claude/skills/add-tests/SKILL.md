@@ -51,10 +51,10 @@ uv run --no-sync pytest -q --no-cov -x tests/test_<file>.py::test_<one>
 
 Run the coverage-bearing suite once at the end, via `/verify`.
 
-## The two failure classes this suite has actually been caught by
+## The three failure classes this suite has actually been caught by
 
-Both are in `docs/notes/day-07.md`. They are here because 541 passing tests did
-not see either one.
+The first two are in `docs/notes/day-07.md`; the third was caught by CI in
+September 2026. All three passed locally first.
 
 **1. A test that samples randomness once is a coin flip, not a test.**
 `parse_key_id` failed on 48.3% of minted keys. A test minting *one* key failed
@@ -84,8 +84,23 @@ touches, ask which of the three endings it runs under, and whether the other two
 are covered *with that subsystem live*. Prefer a parametrised test over the
 endings to three separate ones that quietly share a default.
 
-The general form: when two features each have modes, the bug lives in a
-combination neither feature's own tests reach.
+**3. A test that reads the wall clock is a test that fails on a busy runner.**
+The token bucket refills by `(now - seen) * rate`, so at `tpm=10_000` it gains
+~167 tokens a second. `test_a_finished_request_refunds_what_it_did_not_use`
+asserted an exact bucket movement of 5 against the real clock: it passed on a
+laptop and failed in CI with `assert (8999 - 8995) == (10 // 2)` — the refund
+looked one token short because a few extra milliseconds had refilled one token.
+
+`RateLimiter` and `SpendLedger` both take `clock=` for exactly this reason, and
+`ratelimit.py` says so outright: a limiter "that reads the clock itself is
+non-deterministic, and it cannot be driven by a test". `tests/test_spend.py`
+pins the ledger's clock and `tests/test_resilience.py` has a fake clock so it
+"never flakes on a loaded machine" — so when a test asserts on anything
+time-derived, pin the clock rather than assuming your machine is fast enough.
+
+The general form of all three: the bug lives where a test's *environment*
+varies — the sample it drew, the combination it happened to exercise, the speed
+of the machine it ran on. Pin what varies.
 
 ## Before finishing
 
