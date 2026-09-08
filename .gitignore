@@ -43,3 +43,14 @@ htmlcov/
 # uv
 # uv.lock is deliberately NOT ignored: this is an application, and the
 # lockfile is what makes CI and production installs reproducible.
+
+# Local environment config (secrets, machine-specific overrides).
+# Never committed — .env.example is the checked-in template.
+.env
+.env.*
+!.env.example
+
+# Agent tooling. .claude/settings.json, hooks/, skills/ and agents/ are
+# committed on purpose (ADR-023) — they are repo policy. Personal overrides
+# and machine-local state are not.
+.claude/settings.local.json

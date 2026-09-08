@@ -1,0 +1,174 @@
+"""Application configuration, loaded from the environment.
+
+Values come from environment variables prefixed ``VORTEX_`` (e.g.
+``VORTEX_REDIS_URL``). For local development an optional ``.env`` file in the
+project root is read as a lower-priority source; a real environment variable
+always wins over a line in ``.env``.
+
+``.env`` holds machine-local secrets and is never committed — ``.env.example``
+lists the available keys with safe placeholder values.
+"""
+
+from functools import lru_cache
+from typing import Literal
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+Environment = Literal["local", "dev", "staging", "prod"]
+
+
+class Settings(BaseSettings):
+    """Runtime configuration for the gateway.
+
+    Every field has a default so the app boots with no configuration at all in
+    local development. Deployments override via environment variables.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="VORTEX_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    environment: Environment = "local"
+    log_level: str = "INFO"
+
+    # Redis backs rate limiting and load balancing (see the pyproject scope).
+    redis_url: str = "redis://localhost:6379/0"
+
+    # How long to wait for an upstream provider's *answer*, in seconds. Long,
+    # because generating tokens is slow.
+    request_timeout_seconds: float = 30.0
+
+    # How long to wait for the TCP/TLS handshake, in seconds. Deliberately much
+    # shorter: a host that has not accepted a connection in a few seconds is
+    # unreachable, not busy, and sharing the read budget with it means an
+    # unroutable IP pins a worker for the whole generation window
+    # (docs/notes/day-04.md).
+    connect_timeout_seconds: float = 5.0
+
+    # Client API keys accepted at the edge, comma-separated. Kept as a plain
+    # string rather than a set because pydantic-settings parses collection
+    # types from env vars as JSON, which is a hostile format for an operator
+    # typing a value into a deployment console.
+    #
+    # Superseded by `key_db_path` where one is set, and kept for the case it is
+    # actually good at: a local run, or a single-key deployment that should not
+    # need a database. A key from this list has no per-key limits and no name.
+    api_keys: str = ""
+
+    # SQLite file holding hashed, revocable client keys, minted by the
+    # `vortex-keys` CLI (ADR-003). Set, it becomes the only accepted source of
+    # keys — `api_keys` is ignored rather than merged, because two allow-lists
+    # means revoking from one and still being let in by the other. Empty is the
+    # development default.
+    key_db_path: str = ""
+
+    # Which provider serves which model, as an ordered, comma-separated list of
+    # `pattern=provider` rules — e.g.
+    #     gpt-4o=openai,claude-*=anthropic,local/*=ollama
+    # First match wins, so a specific rule may precede a general one. Parsed by
+    # `vortex_ai_gateway.routing`, which also owns the pattern syntax; this
+    # stays a plain string for the same reason `api_keys` does. The table is
+    # also the enable list: a provider no rule mentions is never constructed,
+    # and an empty table leaves the gateway on its mock (ADR-016, ADR-017).
+    model_routes: str = ""
+
+    # Where a model that matches no rule goes. Empty means "reject it", which
+    # is the safer default: a typo'd model name is a 400 rather than a
+    # surprise bill on whichever provider happened to be listed first.
+    default_provider: str = ""
+
+    # Per-provider credentials and endpoints. An empty base URL means "use the
+    # vendor's own", so only self-hosted or proxied deployments set one.
+    # `routing.build_router` finds these by name, so a fourth provider needs a
+    # matching `<name>_api_key` / `<name>_base_url` pair and nothing else.
+    openai_api_key: str = ""
+    openai_base_url: str = ""
+    anthropic_api_key: str = ""
+    anthropic_base_url: str = ""
+    ollama_api_key: str = ""
+    ollama_base_url: str = ""
+
+    # How a failed upstream call is retried (ADR-001). Applied per provider.
+    retry_max_attempts: int = 3
+    retry_backoff_seconds: float = 0.5
+    retry_max_backoff_seconds: float = 10.0
+
+    # Wall-clock budget for one request including all its retries. Must exceed
+    # `request_timeout_seconds`, or the first slow failure spends the whole
+    # budget and `retry_max_attempts` silently means one — which is precisely
+    # what happens for timeouts, the failure most worth retrying.
+    retry_deadline_seconds: float = 90.0
+
+    # Retry budget: caps retries in aggregate rather than per request, so an
+    # outage cannot turn every client's retries into a load multiplier against
+    # a recovering provider. Zero capacity disables it.
+    retry_budget_capacity: int = 0
+    retry_budget_refill_per_second: float = 0.0
+
+    # Circuit breaker, one per provider (ADR-002). `breaker_reset_seconds` is
+    # the first open window; each reopen multiplies it up to the maximum.
+    breaker_failure_threshold: int = 5
+    breaker_reset_seconds: float = 60.0
+    breaker_backoff_multiplier: float = 2.0
+    breaker_max_open_seconds: float = 600.0
+
+    # Ordered fallback chains, comma-separated, as `primary>next>last` — e.g.
+    #     openai>anthropic,anthropic>ollama
+    # A request routed to `primary` tries the rest of its chain when that
+    # provider's breaker is open or it exhausts its retries. Chains only make
+    # sense between providers that answer to the same model names, since the
+    # request is forwarded unchanged (ADR-020).
+    fallback_chains: str = ""
+
+    # Turns on the Redis-backed rate limiter and usage ledger together. Off by
+    # default because both need Redis, and `uv run uvicorn ...` on a laptop
+    # should not: a gateway that logs a fail-open warning on every request has
+    # trained its operators to ignore the one that matters. With it on, a Redis
+    # outage still only degrades — see ADR-021.
+    metering_enabled: bool = False
+
+    # Per-key rate limits, applied when a key does not carry its own (ADR-021).
+    # Zero means unlimited, which is also what makes local development work:
+    # with no limit to enforce there is nothing to ask Redis, so a gateway with
+    # no Redis behind it never notices one is missing.
+    rate_limit_default_rpm: int = 0
+    rate_limit_default_tpm: int = 0
+
+    # What a request is assumed to cost when the caller did not say. Only the
+    # completion half is guessed — the prompt is in front of us — and the guess
+    # is reconciled against real usage the moment the request settles, so it
+    # governs how much a caller can have *in flight*, not what they are charged.
+    rate_limit_assumed_completion_tokens: int = 512
+
+    # JSON file overriding the built-in price table, as
+    # `{"gpt-4o": {"prompt": 2.5, "completion": 10.0}}` in USD per million
+    # tokens (ADR-022). Empty uses the built-in table alone.
+    price_table_path: str = ""
+
+    # How long per-key usage counters live in Redis. The ledger stores token
+    # counts per day, so this is also how far back `/v1/usage` can look.
+    usage_retention_days: int = 30
+
+    @property
+    def allowed_api_keys(self) -> frozenset[str]:
+        """The accepted client keys, empty when the gateway is left open.
+
+        An empty set means *no key is checked beyond being present* — the
+        development default. Populate ``VORTEX_API_KEYS`` to enforce a real
+        allow-list.
+        """
+        return frozenset(key.strip() for key in self.api_keys.split(",") if key.strip())
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """Return the process-wide settings, read from the environment once.
+
+    Cached so it can be used as a FastAPI dependency (``Depends(get_settings)``)
+    without re-parsing the environment on every request. Call
+    ``get_settings.cache_clear()`` in tests that need a fresh read.
+    """
+    return Settings()

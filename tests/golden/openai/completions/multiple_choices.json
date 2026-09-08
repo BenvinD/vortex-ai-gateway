@@ -1,0 +1,47 @@
+{
+  "id": "chatcmpl-BFqXd5tLqN2mYuWsKcZaRbVfHgEj",
+  "object": "chat.completion",
+  "created": 1741570226,
+  "model": "gpt-4o-mini-2024-07-18",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "A haiku about rain.",
+        "refusal": null,
+        "annotations": []
+      },
+      "logprobs": null,
+      "finish_reason": "stop"
+    },
+    {
+      "index": 1,
+      "message": {
+        "role": "assistant",
+        "content": "Another haiku, truncated by the token cap",
+        "refusal": null,
+        "annotations": []
+      },
+      "logprobs": null,
+      "finish_reason": "length"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 16,
+    "completion_tokens": 18,
+    "total_tokens": 34,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "audio_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "audio_tokens": 0,
+      "accepted_prediction_tokens": 0,
+      "rejected_prediction_tokens": 0
+    }
+  },
+  "service_tier": "default",
+  "system_fingerprint": "fp_34a54ae93c"
+}

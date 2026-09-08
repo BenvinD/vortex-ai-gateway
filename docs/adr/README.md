@@ -12,10 +12,28 @@ This repo is the gateway (Gatewright), which owns the `0xx` range.
 
 | # | Decision | Chose | Rejected | When the rejected option wins |
 |---|----------|-------|----------|-------------------------------|
-| 001 | Retry policy | | | |
-| 002 | Breaker thresholds | | | |
-| 003 | Key storage | | | |
+| 001 | Retry policy | branch on `retryable`, full jitter, wall-clock deadline, optional budget | fixed count for every failure; branch on HTTP status | Streams need establishing-phase retries, or a provider's `Retry-After` proves untrustworthy |
+| 002 | Breaker thresholds | one breaker per provider, single half-open trial, failures counted per request | retries alone; one breaker for the whole gateway | Fleet outgrows per-worker state — then Redis, fail-open |
+| 003 | Key storage | SHA-256-hashed keys in SQLite, minted by a CLI | plaintext env list; Postgres; a `POST /v1/keys` endpoint | More than one node needs the same keys — then Postgres, same schema, same hash |
 | 004 | Streaming cache policy | | | |
 | 005 | Semantic-cache threshold/model | | | |
+| 006 | Health probe semantics | `/healthz` + `/readyz` split | single dependency-checking `/health` | Service mesh owns readiness gating itself |
+| 007 | Configuration source | `pydantic-settings` from env, `.env` local only | scattered `os.environ`; per-env config files | Config outgrows a flat namespace or needs live reload |
+| 008 | Logging & request IDs | structlog JSON to stdout + raw-ASGI request-ID middleware | stdlib text logging; OpenTelemetry now | Need distributed traces/spans, not just correlation IDs |
+| 009 | Unified request/response contract | OpenAI chat-completions shape as the internal contract | bespoke Vortex schema; lowest-common-denominator subset | Gateway stops being a drop-in OpenAI replacement |
+| 010 | Request validation & errors | `extra="forbid"` + cross-field validators, OpenAI `400` error envelope | pass unknown fields through; ignore them | Gateway must proxy provider-specific extras verbatim |
+| 011 | Provider seam & test doubles | narrow `ChatProvider` protocol + scripted `MockProvider` | build the OpenAI adapter first; recorded HTTP fixtures | Verifying one adapter's translation against real vendor bytes |
+| 012 | Chat endpoint & stream framing | OpenAI SSE + `[DONE]`, injected provider, `502` buffered / in-band streamed errors | buffer-only now; `501` until a real adapter exists | Deploying for real, where a mock default is a liability |
+| 013 | Client authentication | `Authorization: Bearer` checked in a router-level dependency, `401` + envelope | leave `/v1` open for now; delegate to a fronting API gateway | A fronting gateway or mesh already authenticates every caller |
+| 014 | Vendor adapters & translation | translate both ways per vendor, refuse what a vendor cannot express | drop unsupported params silently; narrow the contract to the intersection | Callers need one portable request across every provider |
+| 015 | Provider failure taxonomy | typed hierarchy with a `retryable` flag, classified once in the HTTP base | let httpx errors escape; one error class with a status | Only one provider exists and every failure maps to the same status |
+| 016 | Model → provider routing | ordered `pattern=provider` glob table, first match wins | exact-name dict; regexes; provider inferred in code | Selection needs weights, fallbacks or health, not just a name |
+| 017 | Where configuration lives | environment variables, parsed at boot | JSON/YAML file; embedded DB (LiteDB/SQLite) | The table must change at runtime — then Redis, not a local file |
+| 018 | Streamed usage accounting | always ask the provider for usage; forward the chunk only if the caller asked | collect only when asked; estimate from relayed deltas | Usage reporting becomes billable, or arrives per chunk |
+| 019 | Client disconnect on a stream | let the cancellation reach the provider's generator, record the abandonment, re-raise | rely on GC; poll `receive()` for `http.disconnect` | The server never delivers a disconnect and `send()` must be relied on |
+| 020 | Provider fallback | ordered `primary>next` chains in config, hopped only on breaker-open or exhausted retries | no fallback; automatic failover on any error | Callers need one portable request across providers with different model names |
+| 021 | Per-key rate limits | RPM + TPM as one atomic Lua token bucket in Redis, fail-open | per-process counters; fixed-window `INCR` | Limits become a contractual quota — then fail closed, loudly |
+| 022 | Usage ledger | store token counts, price at read time | store dollars (float, or integer nano-USD) | Prices must be frozen per request for audit — then store both |
+| 023 | Agent tooling in the repo | committed hooks/skills that shell out to CI's own tools | nothing in-repo; commit personal prefs too | Hooks become personal preference rather than repo policy |
 
 Fill each row as the ADR lands. The `1xx` range belongs to the RAG repo.
