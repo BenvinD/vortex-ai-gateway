@@ -87,8 +87,20 @@ Both hang off one Redis connection and are absent together, controlled by
 fail *open*, and Redis is deliberately not a readiness check: draining a working
 instance because the limiter is degraded turns a degradation into an outage.
 
-Still to come (per `pyproject.toml` and the ADR index): PII guardrails and
-Redis-backed load balancing. Breaker state is still per worker process.
+`cache.py` is the exact response cache (ADR-004), and it is shaped like
+`metering.py` on purpose: `routes.py` looks up before the provider is touched
+and stores after it answers, and the only part that belongs to the HTTP surface
+is the `X-Cache: HIT|MISS|BYPASS` header. The key is a SHA-256 over the
+*validated* request dumped with sorted keys, minus the four fields that cannot
+change a generated token, namespaced by `key_id` so one tenant's completion is
+never served to another. Streaming requests bypass it in both directions, a hit
+is settled at zero tokens rather than at the cached response's usage, and it
+hangs off the same Redis connection as the meter under its own switch,
+`VORTEX_CACHE_ENABLED`.
+
+Still to come (per `pyproject.toml` and the ADR index): PII guardrails,
+semantic caching (ADR-005) and Redis-backed load balancing. Breaker state and
+cache counters are still per worker process.
 
 ### The src/ layout is load-bearing
 

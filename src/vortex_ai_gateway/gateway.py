@@ -18,6 +18,7 @@ import structlog
 from fastapi import FastAPI, Response, status
 from redis.asyncio import Redis
 
+from vortex_ai_gateway.cache import ResponseCache
 from vortex_ai_gateway.config import Settings, get_settings
 from vortex_ai_gateway.error_handling import install_error_handlers
 from vortex_ai_gateway.keys import KeyStore
@@ -53,10 +54,13 @@ def create_app(
     substitution loud enough to be caught in the logs, since a deployment
     answering from canned replies is the worst failure this service could have.
 
-    ``redis`` backs the rate limiter and the usage ledger. Left out, it is
-    opened from ``settings.redis_url`` when ``metering_enabled`` is set and
-    otherwise not opened at all — the gateway runs with no Redis, no limits and
-    no ledger, which is what a laptop wants (ADR-021).
+    ``redis`` backs the rate limiter, the usage ledger and the response cache.
+    Left out, it is opened from ``settings.redis_url`` when ``metering_enabled``
+    or ``cache_enabled`` is set and otherwise not opened at all — the gateway
+    runs with no Redis, no limits, no ledger and no cache, which is what a
+    laptop wants (ADR-021). One connection serves all three: a second pool to
+    the same server would double the gateway's connection count to say the same
+    thing.
 
     Anything the factory built is closed on shutdown; anything passed in belongs
     to the caller and is left alone.
@@ -64,7 +68,7 @@ def create_app(
     settings = settings or get_settings()
     configure_logging(settings)
 
-    owns_redis = redis is None and settings.metering_enabled
+    owns_redis = redis is None and (settings.metering_enabled or settings.cache_enabled)
     if owns_redis:
         redis = Redis.from_url(settings.redis_url)
 
@@ -88,19 +92,30 @@ def create_app(
     # sick. Deliberately *not* registered as a readiness check — the limiter
     # fails open, so draining a working instance because Redis is down would
     # turn a degradation into an outage.
+    #
+    # Gated on the setting rather than on the connection being there, because
+    # the cache opens that same connection for its own reasons: `metered` is
+    # what decides whether limits and a ledger exist, not whether Redis happens
+    # to be reachable.
+    metered = connection if settings.metering_enabled else None
     meter = Meter(
         settings,
-        limiter=RateLimiter(connection) if connection is not None else None,
+        limiter=RateLimiter(metered) if metered is not None else None,
         ledger=(
             SpendLedger(
-                connection,
+                metered,
                 PriceTable.from_settings(settings),
                 retention_days=settings.usage_retention_days,
             )
-            if connection is not None
+            if metered is not None
             else None
         ),
     )
+
+    # Off unless configured, and a working no-op when it is off: a cache with
+    # no Redis reports nothing, stores nothing, and adds no header, so the
+    # route has no branch on whether one exists (ADR-004).
+    cache = ResponseCache.from_settings(settings, connection)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -126,11 +141,12 @@ def create_app(
     # back to the environment allow-list" (ADR-003).
     app.state.key_store = KeyStore(settings.key_db_path) if settings.key_db_path else None
     app.state.meter = meter
+    app.state.cache = cache
     app.state.redis = connection
 
     app.add_middleware(RequestIDMiddleware)
     install_error_handlers(app)
-    app.include_router(create_chat_router(provider, meter))
+    app.include_router(create_chat_router(provider, meter, cache))
 
     # Dependency probes register here as subsystems come online. Redis is
     # pointedly not one: a subsystem belongs here only if the gateway cannot

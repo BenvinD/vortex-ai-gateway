@@ -6,6 +6,10 @@
 
 vortex-ai-gateway is an AI Gateway designed to serve as a unified control plane and routing hub for AI model interactions. It manages request flow, handles authentication, orchestrates model selection, and provides a centralized entry point for AI applications.
 
+[`docs/architecture.md`](docs/architecture.md) walks one request through every
+layer — auth, limits, cache, routing, resilience, adapter — with the decision
+behind each and the condition under which it was the wrong one.
+
 ## About the Name
 
 **Vortex** — A vortex represents a center of concentrated activity and convergence. In fluid dynamics, a vortex is where multiple flows merge into a cohesive center. We chose this name because a gateway should act as a convergence point—drawing together multiple AI requests, models, and services, then directing them intelligently through a unified system.

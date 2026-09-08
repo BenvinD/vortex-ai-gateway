@@ -8,14 +8,17 @@ being questioned six weeks from now.
 
 ## Index
 
-This repo is the gateway (Gatewright), which owns the `0xx` range.
+This repo is the gateway (Gatewright), which owns the `0xx` range. Numbers are
+**topical, not chronological** — slots were reserved by subject up front, so
+ADR-001 is dated after ADR-019. Read the `Date` line, not the number, for
+sequence.
 
 | # | Decision | Chose | Rejected | When the rejected option wins |
 |---|----------|-------|----------|-------------------------------|
 | 001 | Retry policy | branch on `retryable`, full jitter, wall-clock deadline, optional budget | fixed count for every failure; branch on HTTP status | Streams need establishing-phase retries, or a provider's `Retry-After` proves untrustworthy |
 | 002 | Breaker thresholds | one breaker per provider, single half-open trial, failures counted per request | retries alone; one breaker for the whole gateway | Fleet outgrows per-worker state — then Redis, fail-open |
 | 003 | Key storage | SHA-256-hashed keys in SQLite, minted by a CLI | plaintext env list; Postgres; a `POST /v1/keys` endpoint | More than one node needs the same keys — then Postgres, same schema, same hash |
-| 004 | Streaming cache policy | | | |
+| 004 | Response cache & streaming policy | exact canonical-hash cache in Redis, namespaced per `key_id`, streams bypass | hash the raw body; one global namespace; replay stored chunks | Streams dominate and repeat — then store on the *completed* ending only |
 | 005 | Semantic-cache threshold/model | | | |
 | 006 | Health probe semantics | `/healthz` + `/readyz` split | single dependency-checking `/health` | Service mesh owns readiness gating itself |
 | 007 | Configuration source | `pydantic-settings` from env, `.env` local only | scattered `os.environ`; per-env config files | Config outgrows a flat namespace or needs live reload |

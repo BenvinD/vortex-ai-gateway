@@ -17,11 +17,17 @@ only the decision to hand each chunk to the client. The same applies to what a
 caller is *allowed* to spend: :mod:`~vortex_ai_gateway.metering` decides, and
 the two calls it exposes — admit before, settle after — are all this module
 knows about rate limits and ledgers.
+
+:mod:`~vortex_ai_gateway.cache` is shaped the same way and sits inside the same
+sandwich — look up before, store after — because whether an answer may be
+reused is a policy, and the only part of it that belongs to the HTTP surface is
+the ``X-Cache`` header saying which way it went (ADR-004).
 """
 
 import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from typing import Final
 
 import structlog
 from fastapi import APIRouter, Depends, Query, Request, status
@@ -29,12 +35,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.responses import Response
 
 from vortex_ai_gateway.auth import Principal, require_api_key
+from vortex_ai_gateway.cache import ResponseCache
 from vortex_ai_gateway.contracts import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ErrorDetail,
     ErrorResponse,
     ErrorType,
+    TokenUsage,
     UsageReport,
 )
 from vortex_ai_gateway.metering import Meter, Reservation
@@ -112,19 +120,28 @@ def _failure(exc: Exception) -> tuple[int, ErrorResponse]:
     )
 
 
+#: What a request served from the cache is settled at. Not an omission and not
+#: the provider's original numbers: a hit bought no tokens, so recording the
+#: cached response's usage would put spend in the ledger against an invoice line
+#: that does not exist — and ADR-022 exists so the ledger can be reconciled
+#: against the vendor's bill. The request itself is still counted, and the
+#: token reservation comes back in full (ADR-004).
+CACHED_USAGE: Final = TokenUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0)
+
 #: How far back ``GET /v1/usage`` looks when the caller does not say. A week is
 #: long enough to see a trend and short enough to answer in one round trip per
 #: day of history.
 DEFAULT_USAGE_DAYS = 7
 
 
-def create_chat_router(provider: ChatProvider, meter: Meter) -> APIRouter:
-    """Build the ``/v1`` router served by ``provider``, metered by ``meter``.
+def create_chat_router(provider: ChatProvider, meter: Meter, cache: ResponseCache) -> APIRouter:
+    """Build the ``/v1`` router served by ``provider``, metered and cached.
 
-    Both are injected rather than looked up, so a test can mount the same routes
-    over a scripted double with no patching — and so a gateway with no Redis
-    gets a pass-through :class:`~vortex_ai_gateway.metering.Meter` instead of a
-    branch on every request.
+    All three are injected rather than looked up, so a test can mount the same
+    routes over a scripted double with no patching — and so a gateway with no
+    Redis gets a pass-through :class:`~vortex_ai_gateway.metering.Meter` and a
+    :class:`~vortex_ai_gateway.cache.ResponseCache` that stores nothing, instead
+    of a branch on every request.
     """
     # Auth is declared on the router, not per route, so a route added later
     # cannot be published unauthenticated by omission. The health probes live
@@ -163,9 +180,27 @@ def create_chat_router(provider: ChatProvider, meter: Meter) -> APIRouter:
         nothing upstream. Its headers ride on the response whether or not it was
         allowed, so a caller can see their remaining allowance shrinking instead
         of discovering it at zero.
+
+        The cache is consulted *after* admission and for the same reason in
+        reverse: a hit is served without paying a provider, but it is still a
+        request the caller made, and a cache that skipped the limiter would be a
+        rate limit anyone able to repeat themselves could walk around.
         """
         principal: Principal = http_request.state.principal
         reservation = await meter.admit(principal, request)
+        path = http_request.url.path
+        lookup = await cache.lookup(principal, request, path=path, headers=http_request.headers)
+        headers = {**reservation.headers, **lookup.headers}
+
+        if lookup.response is not None:
+            # Settled at zero rather than discarded: the reservation comes back
+            # either way, but a discard writes nothing, and a caller reading
+            # `/v1/usage` should see the request they made even when it was free.
+            await meter.settle(reservation, CACHED_USAGE)
+            return JSONResponse(
+                content=lookup.response.model_dump(mode="json", exclude_none=True),
+                headers=headers or None,
+            )
 
         if request.stream:
             return StreamingResponse(
@@ -174,7 +209,7 @@ def create_chat_router(provider: ChatProvider, meter: Meter) -> APIRouter:
                 headers={
                     "Cache-Control": "no-store",
                     "X-Accel-Buffering": "no",
-                    **reservation.headers,
+                    **headers,
                 },
             )
 
@@ -185,7 +220,6 @@ def create_chat_router(provider: ChatProvider, meter: Meter) -> APIRouter:
             await meter.discard(reservation)
             http_status, envelope = _failure(exc)
             retry_after = getattr(exc, "retry_after", None)
-            headers = dict(reservation.headers)
             if retry_after:
                 headers["Retry-After"] = str(int(retry_after))
             return JSONResponse(
@@ -195,9 +229,14 @@ def create_chat_router(provider: ChatProvider, meter: Meter) -> APIRouter:
             )
 
         await meter.settle(reservation, completion.usage)
+        # Stored after settlement, and never before the response is in hand: an
+        # entry written for a request that then failed would serve a failure
+        # forever, and the store is a no-op for anything the lookup declined to
+        # give a key to.
+        await cache.store(lookup, completion)
         return JSONResponse(
             content=completion.model_dump(mode="json", exclude_none=True),
-            headers=reservation.headers or None,
+            headers=headers or None,
         )
 
     @router.get("/usage", response_model=UsageReport)

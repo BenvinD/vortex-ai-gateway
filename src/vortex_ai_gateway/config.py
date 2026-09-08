@@ -15,6 +15,7 @@ from typing import Literal
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Environment = Literal["local", "dev", "staging", "prod"]
+CacheScope = Literal["key", "global"]
 
 
 class Settings(BaseSettings):
@@ -151,6 +152,30 @@ class Settings(BaseSettings):
     # How long per-key usage counters live in Redis. The ledger stores token
     # counts per day, so this is also how far back `/v1/usage` can look.
     usage_retention_days: int = 30
+
+    # Turns on the exact response cache (ADR-004). Redis again, and a separate
+    # switch from `metering_enabled` on purpose: a deployment may well want
+    # limits without a cache, and a cache changes what callers *see* — the same
+    # answer twice — where the limiter only changes what they may send.
+    cache_enabled: bool = False
+
+    # How long a cached response lives, in seconds, for any route without its
+    # own entry below. Also the staleness a caller can observe: within the TTL
+    # an identical request cannot produce a different sample.
+    cache_ttl_seconds: int = 300
+
+    # Per-route TTL overrides, comma-separated, as `path=seconds` — e.g.
+    #     /v1/chat/completions=600
+    # Zero is meaningful and is not the same as leaving a route out: it says
+    # this route is never cached, where an absent route falls back to the
+    # default above. Parsed by `vortex_ai_gateway.cache`.
+    cache_ttls: str = ""
+
+    # Who shares a cache entry. `key` gives every API key its own namespace;
+    # `global` shares one across the whole gateway, which is the better hit
+    # rate and only safe where every caller is the same tenant — an exact hit
+    # returns a completion generated under, and billed to, another key.
+    cache_scope: CacheScope = "key"
 
     @property
     def allowed_api_keys(self) -> frozenset[str]:
