@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vortex-ai-gateway"
-version = "0.1.0"
+version = "0.0.1a1"
 description = "Multi-provider LLM gateway with provider abstraction, PII guardrails, rate limiting, and Redis load balancing"
 readme = "README.md"
 requires-python = ">=3.14"
