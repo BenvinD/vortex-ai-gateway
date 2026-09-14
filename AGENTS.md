@@ -98,9 +98,25 @@ is settled at zero tokens rather than at the cached response's usage, and it
 hangs off the same Redis connection as the meter under its own switch,
 `VORTEX_CACHE_ENABLED`.
 
-Still to come (per `pyproject.toml` and the ADR index): PII guardrails,
-semantic caching (ADR-005) and Redis-backed load balancing. Breaker state and
-cache counters are still per worker process.
+`semantic.py` is the second cache tier (ADR-024), consulted only when the exact
+tier *looked and missed* — never when it bypassed, because a bypass is about the
+request, not about one tier. The pipeline is embed → cosine against the stored
+unit vectors → threshold → hit or miss, in numpy, per worker process. Only
+`messages` is embedded; everything else in the request is hashed into the
+namespace the vector is searched in, so the threshold is about wording alone.
+A semantic hit is promoted into the exact tier so the next identical request
+costs a hash, not an embedding. The embedder is an `Embedder` protocol passed
+to `create_app(embedder=...)` — which model embeds is still open — and
+`VORTEX_SEMANTIC_CACHE_ENABLED` without one warns and runs on the exact tier.
+`X-Semantic-Cache` and `X-Semantic-Cache-Score` report the tier's outcome and
+the nearest score, on misses too; that distribution is how the threshold gets
+tuned — and ADR-005 records that with the two embedders measured so far, no
+threshold is safe, which is why the tier is off by default.
+
+Still to come (per `pyproject.toml` and the ADR index): PII guardrails, an
+embedding adapter behind the `Embedder` seam, and Redis-backed load balancing.
+Breaker state, cache counters and the semantic index are still per worker
+process.
 
 ### The src/ layout is load-bearing
 

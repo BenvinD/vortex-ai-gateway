@@ -8,6 +8,7 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from vortex_ai_gateway.cache import CACHE_HEADER
+from vortex_ai_gateway.semantic import SEMANTIC_HEADER, SEMANTIC_SCORE_HEADER
 
 REQUEST_ID_HEADER = "x-request-id"
 
@@ -55,15 +56,19 @@ class RequestIDMiddleware:
 
         status_code = 500
         cache_outcome: str | None = None
+        semantic_outcome: str | None = None
+        semantic_score: str | None = None
         started = time.perf_counter()
 
         async def send_wrapper(message: Message) -> None:
-            nonlocal status_code, cache_outcome
+            nonlocal status_code, cache_outcome, semantic_outcome, semantic_score
             if message["type"] == "http.response.start":
                 status_code = message["status"]
                 headers = MutableHeaders(scope=message)
                 headers[self.header_name] = request_id
                 cache_outcome = headers.get(CACHE_HEADER)
+                semantic_outcome = headers.get(SEMANTIC_HEADER)
+                semantic_score = headers.get(SEMANTIC_SCORE_HEADER)
             await send(message)
 
         logger = structlog.get_logger("vortex_ai_gateway.access")
@@ -76,6 +81,7 @@ class RequestIDMiddleware:
                 http_path=scope["path"],
                 duration_ms=_elapsed_ms(started),
                 **_cache_field(cache_outcome),
+                **_semantic_field(semantic_outcome, semantic_score),
             )
             raise
         else:
@@ -86,6 +92,7 @@ class RequestIDMiddleware:
                 http_status=status_code,
                 duration_ms=_elapsed_ms(started),
                 **_cache_field(cache_outcome),
+                **_semantic_field(semantic_outcome, semantic_score),
             )
         finally:
             structlog.contextvars.clear_contextvars()
@@ -101,6 +108,23 @@ def _cache_field(outcome: str | None) -> dict[str, str]:
     from a cacheless deployment cannot land in either total.
     """
     return {"cache": outcome} if outcome is not None else {}
+
+
+def _semantic_field(outcome: str | None, score: str | None) -> dict[str, str | float]:
+    """The ``semantic_cache`` field and, when there was a nearest entry, its score.
+
+    The score is what ADR-005's threshold is tuned against, and the access log
+    is where every request's score lands — a miss at ``0.93`` under a ``0.95``
+    threshold is either a paraphrase the cache should have caught or a
+    different question it was right to refuse, and only a person reading a
+    sample of them can say which.
+    """
+    if outcome is None:
+        return {}
+    fields: dict[str, str | float] = {"semantic_cache": outcome}
+    if score is not None:
+        fields["semantic_score"] = float(score)
+    return fields
 
 
 def _elapsed_ms(started: float) -> float:

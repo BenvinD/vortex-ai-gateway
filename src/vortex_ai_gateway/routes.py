@@ -22,6 +22,13 @@ knows about rate limits and ledgers.
 sandwich — look up before, store after — because whether an answer may be
 reused is a policy, and the only part of it that belongs to the HTTP surface is
 the ``X-Cache`` header saying which way it went (ADR-004).
+
+:mod:`~vortex_ai_gateway.semantic` is the second tier of that sandwich, and the
+order is the point: the exact cache is a hash and a Redis ``GET``, the semantic
+one is an embedding call before it can look at anything, so the cheap question
+is asked first and the expensive one only when it missed. A semantic hit is
+written back to the exact tier so the next identical request never pays for the
+embedding either (ADR-024).
 """
 
 import asyncio
@@ -56,6 +63,7 @@ from vortex_ai_gateway.providers.errors import (
     ProviderTimeout,
 )
 from vortex_ai_gateway.routing import UnroutableModelError
+from vortex_ai_gateway.semantic import SemanticCache
 from vortex_ai_gateway.streaming import StreamRecord, aclose_stream, metered, wants_usage
 
 logger = structlog.get_logger(__name__)
@@ -134,15 +142,22 @@ CACHED_USAGE: Final = TokenUsage(prompt_tokens=0, completion_tokens=0, total_tok
 DEFAULT_USAGE_DAYS = 7
 
 
-def create_chat_router(provider: ChatProvider, meter: Meter, cache: ResponseCache) -> APIRouter:
+def create_chat_router(
+    provider: ChatProvider,
+    meter: Meter,
+    cache: ResponseCache,
+    semantic_cache: SemanticCache | None = None,
+) -> APIRouter:
     """Build the ``/v1`` router served by ``provider``, metered and cached.
 
-    All three are injected rather than looked up, so a test can mount the same
+    All four are injected rather than looked up, so a test can mount the same
     routes over a scripted double with no patching — and so a gateway with no
     Redis gets a pass-through :class:`~vortex_ai_gateway.metering.Meter` and a
     :class:`~vortex_ai_gateway.cache.ResponseCache` that stores nothing, instead
-    of a branch on every request.
+    of a branch on every request. ``semantic_cache`` defaults to one with no
+    embedder for the same reason: it looks up nothing and adds no header.
     """
+    semantic_cache = semantic_cache if semantic_cache is not None else SemanticCache(None)
     # Auth is declared on the router, not per route, so a route added later
     # cannot be published unauthenticated by omission. The health probes live
     # on the app rather than here precisely so they stay open.
@@ -185,20 +200,38 @@ def create_chat_router(provider: ChatProvider, meter: Meter, cache: ResponseCach
         reverse: a hit is served without paying a provider, but it is still a
         request the caller made, and a cache that skipped the limiter would be a
         rate limit anyone able to repeat themselves could walk around.
+
+        The two cache tiers are consulted cheapest first. The exact tier costs a
+        hash; the semantic tier costs an embedding call, so it is asked only
+        when the exact tier looked and found nothing — and not when the exact
+        tier *declined* to look, because a bypass is a decision about the
+        request, not about one tier.
         """
         principal: Principal = http_request.state.principal
         reservation = await meter.admit(principal, request)
         path = http_request.url.path
         lookup = await cache.lookup(principal, request, path=path, headers=http_request.headers)
-        headers = {**reservation.headers, **lookup.headers}
+        if lookup.response is None and lookup.outcome != "BYPASS":
+            semantic = await semantic_cache.lookup(
+                principal, request, path=path, headers=http_request.headers
+            )
+        else:
+            semantic = semantic_cache.skipped()
+        headers = {**reservation.headers, **lookup.headers, **semantic.headers}
 
-        if lookup.response is not None:
+        cached = lookup.response if lookup.response is not None else semantic.response
+        if cached is not None:
             # Settled at zero rather than discarded: the reservation comes back
             # either way, but a discard writes nothing, and a caller reading
             # `/v1/usage` should see the request they made even when it was free.
             await meter.settle(reservation, CACHED_USAGE)
+            if lookup.response is None:
+                # Found by the expensive tier: promote it to the cheap one, so
+                # the next identical request costs a hash and not an embedding.
+                # A no-op when the exact lookup gave the request no key.
+                await cache.store(lookup, cached)
             return JSONResponse(
-                content=lookup.response.model_dump(mode="json", exclude_none=True),
+                content=cached.model_dump(mode="json", exclude_none=True),
                 headers=headers or None,
             )
 
@@ -234,6 +267,7 @@ def create_chat_router(provider: ChatProvider, meter: Meter, cache: ResponseCach
         # forever, and the store is a no-op for anything the lookup declined to
         # give a key to.
         await cache.store(lookup, completion)
+        await semantic_cache.store(semantic, completion)
         return JSONResponse(
             content=completion.model_dump(mode="json", exclude_none=True),
             headers=headers or None,

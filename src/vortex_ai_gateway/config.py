@@ -177,6 +177,25 @@ class Settings(BaseSettings):
     # returns a completion generated under, and billed to, another key.
     cache_scope: CacheScope = "key"
 
+    # Turns on the semantic cache (ADR-024), consulted only after the exact
+    # cache has missed: an embedding call is a network round trip and a bill,
+    # and a hash lookup is neither. A separate switch from `cache_enabled`
+    # because the two answer different questions — "these bytes" versus "this
+    # question" — and only the second one can be wrong. Needs an embedder, which
+    # `create_app` takes as an argument; enabled without one, the gateway warns
+    # and runs without.
+    semantic_cache_enabled: bool = False
+
+    # The cosine similarity a stored prompt must reach to answer a new one.
+    # Deliberately high: the cost of a false hit is a wrong answer served with
+    # confidence, and the cost of a false miss is one provider call. Every
+    # miss logs the nearest score, which is the evidence for moving this — and
+    # `scripts/threshold_experiment.py` is where that evidence was first
+    # gathered: with the two embedders tried, no value separates paraphrases
+    # from one-token near misses (docs/notes/day-10.md). Re-run it before
+    # trusting any value here with a new model.
+    semantic_cache_threshold: float = 0.95
+
     @property
     def allowed_api_keys(self) -> frozenset[str]:
         """The accepted client keys, empty when the gateway is left open.
