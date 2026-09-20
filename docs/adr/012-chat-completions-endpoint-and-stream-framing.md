@@ -17,5 +17,12 @@ exercisable with no key, and logs a warning at startup because a deployment
 answering from canned replies is the worst failure this service could have.
 Consequences: The mock default must be replaced by explicit configuration
 before anything real is deployed — a `501` (C) would be safer and is worth
-revisiting once the first adapter lands. Response bodies are dumped with
+revisiting once the first adapter lands.
+Update (2026-09-08): the adapters landed (ADR-014) and the mock default stayed,
+on the strength of one thing the `501` cannot do: `uv sync && uvicorn ...` with
+no key and no config still serves a real request end to end, which is what makes
+the seam demonstrable. The startup warning is the whole mitigation, and it is a
+thin one — the safer answer is a boot-time refusal when `environment` is `prod`
+and no routing table is configured, which is a better rule than `501` because it
+distinguishes "unconfigured laptop" from "unconfigured deployment". Response bodies are dumped with
 `exclude_none`, so absent fields are omitted rather than sent as `null`.

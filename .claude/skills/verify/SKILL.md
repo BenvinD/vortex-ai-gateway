@@ -10,7 +10,7 @@ install. Run them **in this order** and stop at the first failure; a later
 check's output is noise once an earlier one is red.
 
 ```bash
-uv sync --locked --no-editable
+uv sync --locked --no-editable --reinstall-package vortex-ai-gateway
 uv run --no-sync ruff check src tests
 uv run --no-sync ruff format --check src tests
 uv run --no-sync mypy src
@@ -28,6 +28,15 @@ uv run --no-sync pytest -v
   `src/` — so a module missing from the wheel is invisible until this runs.
   Combined with the deliberate absence of `pythonpath` in
   `[tool.pytest.ini_options]`, this is what stops a broken wheel from passing.
+- **`--reinstall-package vortex-ai-gateway`** forces the wheel to be rebuilt
+  from the current source. Without it, a *second* `/verify` in the same working
+  tree silently tests the wheel the first one built: uv sees the local package's
+  version unchanged, reports `Checked 49 packages`, and reinstalls nothing, so
+  every source edit since is invisible. CI never hits this — a fresh runner
+  always builds once into an empty venv — which is exactly why it is easy to
+  lose an hour to locally. The symptom is inverted from the one the src/ layout
+  exists to catch: a *fixed* source tree fails the suite, because the suite is
+  correctly reporting the truth about a wheel that predates the fix.
 - **`--no-sync`** on every `uv run` keeps the environment from re-resolving
   between steps, so all four checks see one environment. CI does the same.
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vortex-ai-gateway"
-version = "0.1.0"
+version = "0.0.1a1"
 description = "Multi-provider LLM gateway with provider abstraction, PII guardrails, rate limiting, and Redis load balancing"
 readme = "README.md"
 requires-python = ">=3.14"
@@ -16,6 +16,10 @@ dependencies = [
     "structlog>=24.1.0",
     "redis>=5.0.0",
     "httpx>=0.25.1",
+    # The semantic cache's similarity search is a matrix-vector product over
+    # unit vectors. numpy is that product; a vector database is a dependency on
+    # a server to answer a question one line of numpy answers in-process.
+    "numpy>=2.0.0",
 ]
 
 # Dev tooling is a dependency-group, not an extra: it is installed by

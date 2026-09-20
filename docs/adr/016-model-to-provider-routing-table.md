@@ -20,6 +20,8 @@ provider happened to be listed first.
 Consequences: Two rules can overlap and the reader has to know the order
 decides — the cost of the expressiveness. A default provider is available for
 deployments that would rather forward an unknown model than reject it. Weighted
-splits, fallbacks and health-aware selection do not fit this table; they belong
-to load balancing (ADR-004 and the Redis work), which will consume this mapping
-rather than replace it.
+splits and health-aware selection do not fit this table; they belong to
+Redis-backed load balancing, which will consume this mapping rather than replace
+it. Fallback since landed as its own ordered table rather than in this one
+(ADR-020), for the same reason: a chain is about *providers*, and mixing it into
+a table about *models* would make both harder to read.
