@@ -20,6 +20,7 @@ from redis.asyncio import Redis
 
 from vortex_ai_gateway.cache import ResponseCache
 from vortex_ai_gateway.config import Settings, get_settings
+from vortex_ai_gateway.embedding import build_embedder
 from vortex_ai_gateway.error_handling import install_error_handlers
 from vortex_ai_gateway.keys import KeyStore
 from vortex_ai_gateway.logging_config import configure_logging
@@ -125,14 +126,21 @@ def create_app(
     cache = ResponseCache.from_settings(settings, connection)
 
     # Consulted only after the exact tier misses, and off unless both the
-    # switch and an embedder are present. The warning is the whole difference
-    # between "off" and "silently off" (ADR-005, ADR-024).
+    # switch and an embedder are present. An embedder passed in is the
+    # caller's; otherwise one is built from `embedding_model`, and only when
+    # the tier is on — a laptop with the tier off opens no client to a server
+    # it will never call. The warning is the whole difference between "off"
+    # and "silently off" (ADR-005, ADR-024).
+    owns_embedder = embedder is None and settings.semantic_cache_enabled
+    if owns_embedder:
+        embedder = build_embedder(settings)
     if settings.semantic_cache_enabled and embedder is None:
         structlog.get_logger(__name__).warning(
             "semantic cache enabled but no embedder configured; running without it",
             environment=settings.environment,
         )
     semantic_cache = SemanticCache.from_settings(settings, embedder)
+    built_embedder = embedder if owns_embedder else None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -143,6 +151,9 @@ def create_app(
             await closer()
         if owns_redis and connection is not None:
             await connection.aclose()
+        embedder_closer = getattr(built_embedder, "aclose", None)
+        if embedder_closer is not None:
+            await embedder_closer()
 
     app = FastAPI(
         title="Vortex AI Gateway",

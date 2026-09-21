@@ -113,8 +113,17 @@ the nearest score, on misses too; that distribution is how the threshold gets
 tuned — and ADR-005 records that with the two embedders measured so far, no
 threshold is safe, which is why the tier is off by default.
 
-Still to come (per `pyproject.toml` and the ADR index): PII guardrails, an
-embedding adapter behind the `Embedder` seam, and Redis-backed load balancing.
+`embedding.py` is the one `Embedder` implementation, over Ollama's `/api/embed`,
+and it is deliberately not under `providers/`: that package is the
+`ChatProvider` seam, and an embedder is one call, one vector, no stream and no
+bill, so every failure collapses to a single `EmbeddingError` that the semantic
+tier turns into one warning (ADR-025). `VORTEX_EMBEDDING_MODEL` is the whole
+switch — there is no default model, because a threshold measured for one model
+is a prior for the next — and `create_app` builds it only when the tier is on.
+
+Still to come (per `pyproject.toml` and the ADR index): PII guardrails, a
+number/unit/entity guard in front of the semantic tier (the step
+`docs/notes/day-10.md` names), and Redis-backed load balancing.
 Breaker state, cache counters and the semantic index are still per worker
 process.
 

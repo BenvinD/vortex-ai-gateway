@@ -196,6 +196,17 @@ class Settings(BaseSettings):
     # trusting any value here with a new model.
     semantic_cache_threshold: float = 0.95
 
+    # Which model embeds for the semantic tier, as an Ollama model name — the
+    # half of ADR-005 that configuration decides, and the only thing that needs
+    # naming to turn the tier on. Empty means no embedder, and the tier warns
+    # and stays off. There is no default: a threshold measured for one model
+    # is a prior for the next, so naming the model is meant to be a choice.
+    embedding_model: str = ""
+
+    # Where that model is served. Empty falls back to `ollama_base_url`, then
+    # to Ollama's own default, so one local Ollama is configured once.
+    embedding_base_url: str = ""
+
     @property
     def allowed_api_keys(self) -> frozenset[str]:
         """The accepted client keys, empty when the gateway is left open.

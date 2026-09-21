@@ -272,3 +272,80 @@ request whose usage never arrived (an abandoned stream) is counted as
 `{"gpt-4o": {"prompt": 2.5, "completion": 10.0}}` in USD per million tokens; it
 is consulted before the built-in table, so it need only name what it corrects.
 See ADR-022.
+
+## Response cache
+
+Two tiers, cheap one first. The **exact** tier is a SHA-256 over the validated
+request (sorted keys, minus the fields that cannot change a generated token),
+namespaced per API key so one tenant's completion is never served to another;
+a hit is a Redis `GET` and is settled at zero tokens. The **semantic** tier is
+asked only when the exact tier *looked and missed* — never when it bypassed —
+because an embedding is a network call and a hash is not. Only `messages` is
+embedded; everything else is hashed into the namespace the vector is searched
+in, so the threshold is about wording alone. A semantic hit is promoted into
+the exact tier, so the next identical request costs a hash, not an embedding.
+Streams bypass both. See ADR-004 and ADR-024.
+
+```bash
+VORTEX_CACHE_ENABLED=true
+VORTEX_CACHE_TTL_SECONDS=300
+VORTEX_CACHE_TTLS=/v1/chat/completions=600   # per route; 0 means never cache
+VORTEX_CACHE_SCOPE=key                       # or global, single-tenant only
+VORTEX_SEMANTIC_CACHE_ENABLED=false          # see below for why
+VORTEX_SEMANTIC_CACHE_THRESHOLD=0.95
+VORTEX_EMBEDDING_MODEL=                      # an Ollama model name; empty = no embedder
+VORTEX_EMBEDDING_BASE_URL=                   # falls back to VORTEX_OLLAMA_BASE_URL
+```
+
+Every response says which tier answered — `X-Cache: HIT|MISS|BYPASS`, and
+`X-Semantic-Cache` with `X-Semantic-Cache-Score` carrying the nearest cosine
+on misses too. That score distribution is the evidence for moving the
+threshold. `X-Vortex-Cache-Bypass: true` on a request skips lookup *and* store,
+so debugging the cache cannot change what is in it.
+
+### Why the semantic tier is off by default
+
+The threshold was measured, not guessed: `scripts/threshold_experiment.py`
+embeds 20 paraphrase pairs (should HIT) and 20 hard near-miss pairs — one
+changed number, a swapped unit, an antonym — that must MISS, and picks the
+threshold under one rule: **no near miss may clear it**. With both local
+embedders tried, no threshold does.
+
+![Cosine similarity of prompt pairs, nomic-embed-text: no safe threshold](docs/notes/threshold-nomic-embed-text.png)
+
+![Cosine similarity of prompt pairs, mxbai-embed-large: no safe threshold](docs/notes/threshold-mxbai-embed-large.png)
+
+| model | paraphrase min / median | near-miss median / **max** | at 0.95: false hits / false misses | safe threshold |
+|---|---|---|---|---|
+| `nomic-embed-text` | 0.838 / 0.948 | 0.893 / **0.996** | 2/20 / 10/20 | none |
+| `mxbai-embed-large` | 0.879 / 0.952 | 0.903 / **0.986** | 1/20 / 8/20 | none |
+
+The worst near miss — *Convert 5 miles to kilometres* vs *Convert 5 kilometres
+to miles*, 0.996 — outscores the best genuine paraphrase. Cosine over a
+sentence embedding measures what a text is *about*, and those two are about
+the same thing; a cache serves answers, and theirs differ. So the tier ships
+as tested plumbing with a documented reason not to enable it (ADR-005).
+Enabling it is a procedure, not a flag: pull a model, run the script, set the
+threshold it prints, and re-run on every model change.
+
+```bash
+ollama pull nomic-embed-text
+uv run python scripts/threshold_experiment.py --model nomic-embed-text --url http://localhost:11434
+VORTEX_SEMANTIC_CACHE_ENABLED=true VORTEX_EMBEDDING_MODEL=nomic-embed-text \
+  uv run uvicorn vortex_ai_gateway.gateway:app
+```
+
+The embedder is `embedding.py`, its own seam rather than a chat adapter
+(ADR-025). With it on, the two-tier path reads back in the headers:
+
+```
+"What's the capital of France?"   X-Cache: MISS  X-Semantic-Cache: MISS
+"capital city of France?"         X-Cache: MISS  X-Semantic-Cache: HIT   X-Semantic-Cache-Score: 0.9658
+"capital city of France?"         X-Cache: HIT   X-Semantic-Cache: BYPASS
+```
+
+— and so does the false hit the plot predicts: *Convert 5 kilometres to miles*
+is served the answer to *Convert 5 miles to kilometres* at 0.9955.
+
+Raw scores are in `docs/notes/threshold-<model>.json`; the write-up is
+`docs/notes/day-10.md`.
