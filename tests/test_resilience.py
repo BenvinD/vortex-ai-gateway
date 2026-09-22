@@ -66,18 +66,6 @@ class ScriptedProvider:
 
 
 @pytest.fixture
-def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    """Capture every backoff instead of serving it, and record the durations."""
-    recorded: list[float] = []
-
-    async def _capture(seconds: float) -> None:
-        recorded.append(seconds)
-
-    monkeypatch.setattr(asyncio, "sleep", _capture)
-    return recorded
-
-
-@pytest.fixture
 def clock(monkeypatch: pytest.MonkeyPatch) -> Callable[[float], None]:
     """A fake monotonic clock the tests advance by hand."""
     current = 0.0

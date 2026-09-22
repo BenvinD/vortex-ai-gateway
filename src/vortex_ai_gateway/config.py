@@ -10,12 +10,14 @@ lists the available keys with safe placeholder values.
 """
 
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Environment = Literal["local", "dev", "staging", "prod"]
 CacheScope = Literal["key", "global"]
+TracingExporter = Literal["otlp", "console"]
 
 
 class Settings(BaseSettings):
@@ -206,6 +208,49 @@ class Settings(BaseSettings):
     # Where that model is served. Empty falls back to `ollama_base_url`, then
     # to Ollama's own default, so one local Ollama is configured once.
     embedding_base_url: str = ""
+
+    # What this process calls itself in traces and in `vortex_build_info`. One
+    # name per deployable, not per instance: a collector groups by this and
+    # tells instances apart by the resource attributes it adds itself.
+    service_name: str = "vortex-ai-gateway"
+
+    # Turns on the OpenTelemetry SDK (ADR-026). Off by default, and off costs
+    # nothing rather than a little: with no SDK installed the OTel API hands
+    # back a no-op tracer, so the `span()` calls at the cache, provider and
+    # retry seams stay in the code path and do nothing at all. On, spans go to
+    # an OTLP collector — one trace per request, with a child span per cache
+    # tier, per provider call and per retry attempt.
+    tracing_enabled: bool = False
+
+    # Where spans go. `otlp` speaks OTLP over HTTP to a collector; `console`
+    # prints them as JSON, which is how you find out what is being produced
+    # without standing up a collector first.
+    tracing_exporter: TracingExporter = "otlp"
+
+    # The collector's trace endpoint, e.g. `http://localhost:4318/v1/traces`.
+    # Empty defers to the SDK's own OTEL_EXPORTER_OTLP_* environment
+    # variables, so an existing OTel-configured host needs nothing set here.
+    tracing_endpoint: str = ""
+
+    # Share of traces kept, between 0 and 1. Applied only to traces that start
+    # here: a request arriving with a sampled parent is always kept, or the
+    # trace would have a hole in it exactly where the gateway is.
+    tracing_sample_ratio: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0
+
+    # Publishes the Prometheus scrape endpoint. On by default, unlike every
+    # other subsystem here, because it needs nothing: no Redis, no collector,
+    # no credentials. Off removes the route; the counters are still updated,
+    # since the cost of an atomic increment is not worth a branch (ADR-028).
+    metrics_enabled: bool = True
+
+    # Where that endpoint lives. Configurable because a sidecar or a service
+    # mesh may already own `/metrics` on this port.
+    metrics_path: str = "/metrics"
+
+    # How many distinct values the `model` label may take before the rest
+    # report as `other`. A label a caller picks is a time series a caller
+    # allocates, and this is the number that bounds it (ADR-027).
+    metrics_label_budget: Annotated[int, Field(ge=1)] = 50
 
     @property
     def allowed_api_keys(self) -> frozenset[str]:

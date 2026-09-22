@@ -1,0 +1,15 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    # A fixed UID, because the committed dashboard JSON refers to the
+    # datasource by UID. Letting Grafana generate one would make every panel
+    # in that file point at a datasource that does not exist yet.
+    uid: vortex-prometheus
+    jsonData:
+      timeInterval: 5s
+    editable: false

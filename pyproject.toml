@@ -20,6 +20,20 @@ dependencies = [
     # unit vectors. numpy is that product; a vector database is a dependency on
     # a server to answer a question one line of numpy answers in-process.
     "numpy>=2.0.0",
+    # The scrape endpoint and its in-process registry. Small, no transport of
+    # its own, and the only thing `/metrics` needs.
+    "prometheus-client>=0.20.0",
+    # Tracing. The API alone is what `src/` imports; the SDK and the exporter
+    # are touched by `tracing.py` and nothing else, and do nothing at all until
+    # `VORTEX_TRACING_ENABLED` is set. They are ordinary dependencies rather
+    # than an extra because CI installs no extras: an extra is a module mypy
+    # never checks and pytest never imports, which is the wrong half of the
+    # codebase to leave unverified (ADR-026). The OTLP/HTTP exporter brings
+    # `requests` into a service that already speaks httpx — the price of a wire
+    # format every collector already understands.
+    "opentelemetry-api>=1.27.0",
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.27.0",
 ]
 
 # Dev tooling is a dependency-group, not an extra: it is installed by
@@ -37,6 +51,11 @@ dev = [
     # Lua script rather than a Python re-implementation of it. A rate limiter
     # tested against a re-implementation tests the re-implementation.
     "fakeredis[lua]>=2.37.1",
+    # Declared rather than inherited from pre-commit's own tree: `tests/` reads
+    # the Grafana datasource provisioning to check the committed dashboard
+    # points at a UID that `deploy/` actually pins, and a transitive dependency
+    # is one somebody else's release can remove.
+    "pyyaml>=6.0",
 ]
 
 # `types-redis` is deliberately absent. redis-py ships `py.typed` from 5.0, and

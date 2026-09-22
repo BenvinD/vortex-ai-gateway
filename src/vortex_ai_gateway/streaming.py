@@ -38,6 +38,7 @@ from vortex_ai_gateway.contracts import (
     StreamOptions,
     TokenUsage,
 )
+from vortex_ai_gateway.metrics import STREAMS, model_label
 
 logger = structlog.get_logger(__name__)
 
@@ -161,3 +162,11 @@ class StreamRecord:
             total_tokens=usage.total_tokens if usage else None,
             duration_ms=round((time.perf_counter() - self.started) * 1000, 2),
         )
+        # The same three-way split as the log line, and the reason it is a
+        # metric as well: an abandonment rate is a *ratio* that has to be
+        # watched over time — tokens generated for a client that hung up are
+        # the one cost with nothing at all to show for it — and a ratio is what
+        # a log query is worst at (ADR-019).
+        STREAMS.labels(
+            provider=self.provider, model=model_label(self.model), outcome=self.outcome
+        ).inc()

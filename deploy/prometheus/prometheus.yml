@@ -1,0 +1,26 @@
+# Scrape configuration for the compose stack.
+
+global:
+  # Five seconds rather than the usual fifteen. This stack exists to watch a
+  # traffic generator that runs for a minute or two, and at 15s a two-minute
+  # run is eight points — enough to draw a line through and not enough to see
+  # a retry storm start and stop.
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  external_labels:
+    stack: vortex-dev
+
+scrape_configs:
+  - job_name: vortex-gateway
+    # The gateway's counters are per worker process and the container runs one
+    # worker, so this target is one worker and the numbers are whole. Scaling
+    # the service to two replicas would give two targets — which is correct,
+    # and is why the dashboard sums rather than reads a single series.
+    static_configs:
+      - targets: ["gateway:8000"]
+        labels:
+          service: vortex-ai-gateway
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

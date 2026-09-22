@@ -139,6 +139,10 @@ uv run pre-commit run --all-files
 ```
 src/vortex_ai_gateway/    # the package (src/ layout, not flat)
 tests/                    # imports the installed package, never src/
+scripts/                  # one-off experiments and load generators
+docs/design|adr|notes/    # the paper trail: before, decided, after
+deploy/                   # Prometheus config, Grafana provisioning, the dashboard JSON
+compose.yaml, Dockerfile  # the reference stack (see Observability)
 ```
 
 The `src/` layout is deliberate. Tests import `vortex_ai_gateway` from the
@@ -349,3 +353,177 @@ is served the answer to *Convert 5 miles to kilometres* at 0.9955.
 
 Raw scores are in `docs/notes/threshold-<model>.json`; the write-up is
 `docs/notes/day-10.md`.
+
+## Observability
+
+Three things, in one stack: a trace per request, a Prometheus endpoint, and a
+dashboard committed as a file.
+
+```bash
+docker compose up -d                       # gateway + redis + prometheus + grafana
+uv run python scripts/generate_traffic.py  # put something on it
+open http://localhost:3000                 # Grafana, anonymous, dashboard already there
+```
+
+| | |
+|---|---|
+| Gateway | <http://localhost:8000/metrics> |
+| Prometheus | <http://localhost:9090> |
+| Grafana | <http://localhost:3000> — dashboard **Vortex / Vortex AI Gateway** |
+| Jaeger | <http://localhost:16686> — `VORTEX_TRACING_ENABLED=true docker compose --profile tracing up -d` |
+
+Nothing in that stack is a production default: Grafana has authentication off,
+Redis has no password, and the gateway runs on its mock provider so the whole
+thing comes up with no vendor keys and no bill.
+
+### Metrics
+
+`/metrics` is served **open**, beside `/healthz` and `/readyz` rather than under
+`/v1`, because a scraper has no API key and issuing it one puts a credential
+that can read your traffic volumes into a monitoring system's config file
+(ADR-028). It publishes counts, latencies and totals — never a prompt, a
+completion, or a key. A gateway exposed directly to the internet should set
+`VORTEX_METRICS_ENABLED=false` and scrape a sidecar.
+
+| Metric | What it answers |
+|---|---|
+| `vortex_requests_total{route,method,status,model,provider}` | traffic, error rate, model mix |
+| `vortex_request_duration_seconds` | latency quantiles, by route and model |
+| `vortex_stream_ttft_seconds` | time to first token — streams only |
+| `vortex_cache_lookups_total{tier,outcome}` | hit rate per tier, bypasses excluded |
+| `vortex_provider_attempts_total{provider,outcome}` | upstream calls per request served |
+| `vortex_provider_retries_total`, `..._give_ups_total{reason}` | the retry storm, and how it ended |
+| `vortex_fallbacks_total`, `vortex_breaker_transitions_total`, `vortex_breaker_state` | what failed over, and what is refusing traffic now |
+| `vortex_streams_total{outcome}` | completed / failed / **abandoned** |
+| `vortex_tokens_total{model,kind}`, `vortex_cost_usd_total{model}` | what it cost |
+
+The numbers are per **worker process**, like the circuit breaker's state and
+both caches' counters. Run one worker per port and scale with containers.
+
+**`model` is capped.** It comes out of a request body, and a Prometheus label
+value allocates a series that lives until the process exits — so the gateway
+admits `VORTEX_METRICS_LABEL_BUDGET` distinct values (50 by default) and reports
+everything after that as `other` (ADR-027). Seeing `other` on a dashboard means
+raise the budget. `route` is the matched route *template*, never the path as
+sent, so a scanner guessing URLs allocates one series and not one per guess.
+
+### Tracing
+
+Off by default, and off costs nothing rather than little: with no SDK provider
+installed the OpenTelemetry API returns a no-op tracer, so the instrumentation
+at the seams stays in the code path and does nothing.
+
+```bash
+VORTEX_TRACING_ENABLED=true VORTEX_TRACING_EXPORTER=console \
+  uv run uvicorn vortex_ai_gateway.gateway:app
+```
+
+One trace per request, branching at the four things worth timing separately.
+This is a real trace from a gateway pointed at a dead upstream, with
+`VORTEX_RETRY_MAX_ATTEMPTS=3`:
+
+```
+POST /v1/chat/completions            ERROR  status=502  model=gpt-4o-mini  provider=router
+├─ cache.exact.lookup                       tier=exact     outcome=off
+├─ cache.semantic.lookup                    tier=semantic  outcome=off
+└─ provider.complete                 ERROR  provider=router  model=gpt-4o-mini
+   ├─ provider.attempt               ERROR  attempt=1 of 3
+   ├─ provider.attempt               ERROR  attempt=2 of 3
+   └─ provider.attempt               ERROR  attempt=3 of 3
+```
+
+That is the retry storm as a shape rather than as three log lines nobody
+joined. Every log line the request emits carries `trace_id` and `span_id`, so a
+line copied out of the logs pastes straight into Jaeger:
+
+```json
+{"event": "request completed", "http_status": 502, "duration_ms": 349.1,
+ "request_id": "1072374a1ca4473f815e7e1803a2402a",
+ "trace_id": "2197d057837046a1545a96477e00b693", "span_id": "79c00601d3bbee17"}
+```
+
+Spans are written by hand rather than installed by
+`opentelemetry-instrumentation-fastapi`, because that installs itself in the
+`BaseHTTPMiddleware` shape this codebase already refuses — it breaks streaming,
+and streaming with a correct ending taxonomy is the most carefully built thing
+here (ADR-026).
+
+### Generating traffic
+
+`scripts/generate_traffic.py` sends a deliberate *mix* — repeats so the cache
+has something to hit, several models so the breakdowns have series, streams so
+TTFT has a source, and a few bad requests so the error panel is a working error
+panel — then reads the result back out of `/metrics`. A real run, 600 requests
+against the mock provider with Redis and the exact cache on:
+
+```
+  sent 600 requests in 1.3s (477/s)
+
+  client saw
+    kind      buffered=416, bypass=38, malformed=9, stream=110, unroutable=27
+    status    200=591, 400=9
+    X-Cache   BYPASS=148, HIT=410, MISS=33, none=9
+    latency   p50=25ms p95=71ms
+
+  gateway published
+    requests  600 total, 600 on the chat route
+    cache     410 hits / 443 lookups = 92.6%, and 148 bypasses that are in neither
+    tokens    2671
+    cost      $0.002598
+    streams   110, 110 with a TTFT observation
+```
+
+The 148 bypasses are the 110 streams (which bypass the cache in both
+directions, ADR-004) plus the 38 requests that asked to. They are in neither
+half of the hit rate, which is the point: the cache was never asked, so it
+cannot have missed.
+
+And the resilience counters from the dead-upstream gateway above, after four
+requests with `VORTEX_BREAKER_FAILURE_THRESHOLD=2`:
+
+```
+vortex_provider_attempts_total{outcome="error",provider="openai"}          6.0
+vortex_provider_retries_total{error="ProviderUnavailable",...}             4.0
+vortex_provider_give_ups_total{provider="openai",reason="attempts exhausted"} 2.0
+vortex_breaker_transitions_total{provider="openai",state="open"}           1.0
+vortex_breaker_state{provider="openai"}                                    2.0
+vortex_requests_total{...,status="502"}                                    2.0
+vortex_requests_total{...,status="503"}                                    2.0
+```
+
+Six upstream calls for the first two requests — three attempts each — and then
+zero for the next two, because the breaker opened and the 503s cost nothing
+(ADR-002). `sum(rate(vortex_provider_attempts_total)) / sum(rate(vortex_requests_total))`
+is that story as one line on the dashboard.
+
+### The dashboard
+
+`deploy/grafana/dashboards/vortex-gateway.json` is provisioned into Grafana on
+startup and UI edits are disabled, so the dashboard is a file that shows up in a
+diff rather than a page in somebody's browser. Eighteen panels; the six that
+carry the most:
+
+| Panel | Query |
+|---|---|
+| Error rate | `sum(rate(vortex_requests_total{status=~"5.."}[$__rate_interval]))` over the total |
+| Exact cache hit rate | `HIT` over `HIT + MISS`, with `BYPASS` out of the denominator |
+| p95 chat latency | `histogram_quantile(0.95, sum by (le) (rate(vortex_request_duration_seconds_bucket{route="/v1/chat/completions"}[...])))` |
+| Upstream calls per request | `sum(rate(vortex_provider_attempts_total[...])) / sum(rate(vortex_requests_total{route="/v1/chat/completions"}[...]))` |
+| Breaker state | `vortex_breaker_state`, mapped 0 → closed, 1 → half-open, 2 → **OPEN** |
+| Spend / hour | `sum(rate(vortex_cost_usd_total[...])) * 3600` |
+
+> **No screenshot yet.** Docker is not installed on the machine this was built
+> on, so the stack has never been stood up end to end. What *is* verified runs
+> in CI: every `vortex_*` metric the eighteen panels query exists on a live
+> gateway, and the datasource UID they reference is the one `deploy/` pins —
+> which is the failure that would otherwise be found by a person reading "No
+> data" on one panel out of eighteen. What is **not** verified is everything
+> that needs a container to run: the `Dockerfile` has never been built, and
+> Prometheus has never scraped anything. The gateway numbers above are real and
+> were measured natively against Redis and uvicorn. On a machine with Docker:
+>
+> ```bash
+> docker compose up -d
+> uv run python scripts/generate_traffic.py --requests 2000 --delay 0.05
+> open http://localhost:3000   # screenshot it, and replace this note
+> ```

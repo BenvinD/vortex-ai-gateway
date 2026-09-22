@@ -1,0 +1,130 @@
+# The observability stack: the gateway, the Redis it needs to have a cache and
+# a limiter at all, and the two things that read what it publishes.
+#
+#   docker compose up -d                        # gateway + redis + prometheus + grafana
+#   VORTEX_TRACING_ENABLED=true docker compose --profile tracing up -d
+#                                               # ...and Jaeger, receiving spans
+#
+#   gateway     http://localhost:8000/metrics
+#   prometheus  http://localhost:9090
+#   grafana     http://localhost:3000   (anonymous, already pointed at Prometheus)
+#   jaeger      http://localhost:16686  (tracing profile only)
+#
+# Everything in here is a *development* stack. Grafana has authentication
+# turned off, Redis has no password, and the gateway accepts any well-formed
+# bearer token because `VORTEX_API_KEYS` is empty. None of that is a default
+# to carry into a deployment.
+
+name: vortex
+
+services:
+  redis:
+    image: redis:7-alpine
+    # `--save ""` turns off RDB snapshots. Everything this Redis holds is a
+    # cache entry or a rate-limit bucket, both of which are correct to lose on
+    # restart, and a fork-to-disk pause on a laptop is a latency spike in the
+    # numbers you came here to measure.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      VORTEX_ENVIRONMENT: dev
+      VORTEX_LOG_LEVEL: INFO
+      VORTEX_REDIS_URL: redis://redis:6379/0
+
+      # Both tiers of the metering subsystem, and the exact response cache.
+      # On here and off in `.env.example` for the same reason: they need Redis,
+      # and this is the one place a Redis is guaranteed to exist.
+      VORTEX_METERING_ENABLED: "true"
+      VORTEX_RATE_LIMIT_DEFAULT_RPM: "600"
+      VORTEX_RATE_LIMIT_DEFAULT_TPM: "150000"
+      VORTEX_CACHE_ENABLED: "true"
+      VORTEX_CACHE_TTL_SECONDS: "300"
+
+      # The semantic tier stays off, as ADR-005 says it should until a
+      # number-and-unit guard exists. It also needs an embedding server this
+      # stack does not run.
+      VORTEX_SEMANTIC_CACHE_ENABLED: "false"
+
+      # No routing table, so the gateway serves canned replies from its mock
+      # provider — which is what makes `docker compose up -d` work with no
+      # vendor keys, and what makes the dashboard reproducible. Point it at a
+      # real vendor by setting these two:
+      #   VORTEX_MODEL_ROUTES: gpt-4o-mini=openai
+      #   VORTEX_OPENAI_API_KEY: sk-...
+      VORTEX_MODEL_ROUTES: ""
+
+      VORTEX_METRICS_ENABLED: "true"
+      # Set it on the command line together with the profile, because the
+      # profile is what starts the collector these spans are addressed to:
+      #   VORTEX_TRACING_ENABLED=true docker compose --profile tracing up -d
+      # On without Jaeger running, the exporter retries against a host that
+      # does not resolve — harmless, and pure noise in the log.
+      VORTEX_TRACING_ENABLED: "${VORTEX_TRACING_ENABLED:-false}"
+      VORTEX_TRACING_EXPORTER: otlp
+      VORTEX_TRACING_ENDPOINT: http://jaeger:4318/v1/traces
+      VORTEX_SERVICE_NAME: vortex-ai-gateway
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+      # Needed by Grafana's "Explore" and by anything that wants to reload the
+      # config without restarting the container.
+      - --web.enable-lifecycle
+    depends_on:
+      - gateway
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    ports:
+      - "3000:3000"
+    environment:
+      # A login screen between you and a dashboard of your own laptop's
+      # traffic is friction with nothing behind it. Do not copy this.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      # Provisioning, not the UI: the datasource and the dashboard are files in
+      # this repository, so a change to either shows up in a diff. A dashboard
+      # edited in the browser and saved only to Grafana's own database is one
+      # nobody can review and nobody else gets.
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+  jaeger:
+    # Traces, under a profile so the default stack stays the four services the
+    # dashboard needs. All-in-one: collector, storage and UI in one container,
+    # with in-memory storage that is wiped on restart — which is right for
+    # looking at a retry storm and wrong for anything else.
+    profiles: ["tracing"]
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # UI
+      - "4318:4318"    # OTLP/HTTP, which is what `tracing.py` speaks

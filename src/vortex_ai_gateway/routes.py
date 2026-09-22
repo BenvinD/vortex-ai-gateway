@@ -29,6 +29,16 @@ one is an embedding call before it can look at anything, so the cheap question
 is asked first and the expensive one only when it missed. A semantic hit is
 written back to the exact tier so the next identical request never pays for the
 embedding either (ADR-024).
+
+This module is also where a request's trace grows its first branches. The three
+things worth waiting on — each cache tier, and the provider — get a child span
+of the server span :class:`~vortex_ai_gateway.middleware.TelemetryMiddleware`
+opened, which is what makes "the cheap question first" a visible claim rather
+than a comment: an exact lookup that takes longer than the embedding it was
+meant to save is a picture, not a paragraph. Two facts the router knows and
+nothing downstream does — the model asked for, and who ended up serving it —
+are written to ``request.state`` for the same middleware to label its metrics
+with (ADR-026, ADR-027).
 """
 
 import asyncio
@@ -65,6 +75,7 @@ from vortex_ai_gateway.providers.errors import (
 from vortex_ai_gateway.routing import UnroutableModelError
 from vortex_ai_gateway.semantic import SemanticCache
 from vortex_ai_gateway.streaming import StreamRecord, aclose_stream, metered, wants_usage
+from vortex_ai_gateway.tracing import Span, span
 
 logger = structlog.get_logger(__name__)
 
@@ -208,19 +219,31 @@ def create_chat_router(
         request, not about one tier.
         """
         principal: Principal = http_request.state.principal
+        # Written before anything can fail, so a 429, a 502 and a timeout are
+        # all labelled with the model that caused them rather than `unknown`.
+        # `provider.name` is the head of whatever was mounted — an adapter, a
+        # resilience wrapper, or the router, which calls itself `router` — and
+        # is corrected below the moment a response says who actually served.
+        http_request.state.model = request.model
+        http_request.state.provider = provider.name
         reservation = await meter.admit(principal, request)
         path = http_request.url.path
-        lookup = await cache.lookup(principal, request, path=path, headers=http_request.headers)
+        with span("cache.exact.lookup", {"vortex.cache.tier": "exact"}) as exact_span:
+            lookup = await cache.lookup(principal, request, path=path, headers=http_request.headers)
+            _mark(exact_span, lookup.outcome)
         if lookup.response is None and lookup.outcome != "BYPASS":
-            semantic = await semantic_cache.lookup(
-                principal, request, path=path, headers=http_request.headers
-            )
+            with span("cache.semantic.lookup", {"vortex.cache.tier": "semantic"}) as near_span:
+                semantic = await semantic_cache.lookup(
+                    principal, request, path=path, headers=http_request.headers
+                )
+                _mark(near_span, semantic.outcome, score=semantic.score)
         else:
             semantic = semantic_cache.skipped()
         headers = {**reservation.headers, **lookup.headers, **semantic.headers}
 
         cached = lookup.response if lookup.response is not None else semantic.response
         if cached is not None:
+            _served_by(http_request, cached)
             # Settled at zero rather than discarded: the reservation comes back
             # either way, but a discard writes nothing, and a caller reading
             # `/v1/usage` should see the request they made even when it was free.
@@ -247,7 +270,11 @@ def create_chat_router(
             )
 
         try:
-            completion = await provider.complete(request)
+            with span(
+                "provider.complete",
+                {"vortex.provider": provider.name, "vortex.model": request.model},
+            ):
+                completion = await provider.complete(request)
         except Exception as exc:
             logger.exception("provider request failed", provider=provider.name, model=request.model)
             await meter.discard(reservation)
@@ -261,6 +288,7 @@ def create_chat_router(
                 headers=headers or None,
             )
 
+        _served_by(http_request, completion)
         await meter.settle(reservation, completion.usage)
         # Stored after settlement, and never before the response is in hand: an
         # entry written for a request that then failed would serve a failure
@@ -294,6 +322,34 @@ def create_chat_router(
         return await meter.ledger.report(principal.key_id, days=days)
 
     return router
+
+
+def _mark(current: Span, outcome: str | None, score: float | None = None) -> None:
+    """Put a cache tier's verdict on its span.
+
+    A miss is worth a span even though it found nothing: the span's *duration*
+    is what a lookup cost, and a tier whose misses are slow is the one thing a
+    two-tier cache can get catastrophically wrong.
+    """
+    if not current.is_recording():
+        return
+    current.set_attribute("vortex.cache.outcome", outcome or "off")
+    if score is not None:
+        current.set_attribute("vortex.cache.score", score)
+
+
+def _served_by(http_request: Request, response: ChatCompletionResponse) -> None:
+    """Record which provider actually answered, for the metric labels.
+
+    Read off the response rather than from the provider that was called,
+    because with a router or a fallback chain in front those are different
+    names — and the whole reason ``response.vortex`` exists is that "who served
+    this" is not answerable from the call site (ADR-020). A cached response
+    carries the metadata of the call that first produced it, which is the
+    honest answer: those tokens were bought from that provider.
+    """
+    if response.vortex is not None:
+        http_request.state.provider = response.vortex.provider
 
 
 def _today() -> str:

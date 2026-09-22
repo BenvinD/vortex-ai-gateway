@@ -25,6 +25,10 @@ uv run pre-commit run --all-files
 uv run vortex-keys create --name ci --rpm 600 --tpm 150000   # mint a client key
 uv run vortex-keys list                  # every key, newest first
 uv run vortex-keys revoke <key_id>       # takes effect on the next request
+
+docker compose up -d                     # gateway + redis + prometheus + grafana
+VORTEX_TRACING_ENABLED=true docker compose --profile tracing up -d   # ...and Jaeger
+uv run scripts/generate_traffic.py       # mixed load, then read /metrics back
 ```
 
 `vortex-keys` is a `[project.scripts]` entry point, so it exists only after
@@ -121,11 +125,44 @@ tier turns into one warning (ADR-025). `VORTEX_EMBEDDING_MODEL` is the whole
 switch — there is no default model, because a threshold measured for one model
 is a prior for the next — and `create_app` builds it only when the tier is on.
 
+`metrics.py` and `tracing.py` are the observability pair, and they answer
+different questions on purpose. `metrics.py` declares every Prometheus
+instrument in one registry of its own — nothing is on `/metrics` that this file
+did not name — and owns `LabelBudget`, which caps how many distinct values a
+caller-controlled label may take before the rest report as `other`: `model`
+comes out of a request body, and an uncapped label is a time series a caller
+allocates and nothing ever frees (ADR-027). `tracing.py` is the only module
+that touches the OpenTelemetry SDK, and the API it exposes — `span()`,
+`trace_context()` — is a no-op until `VORTEX_TRACING_ENABLED` installs a
+provider, so the instrumentation at the seams is unconditional and costs
+nothing switched off. `configure_tracing` returns *ownership*, not liveness,
+because OTel's provider is a process global that refuses replacement.
+
+`middleware.py` now holds two raw-ASGI middlewares and their order is
+load-bearing: `RequestIDMiddleware` is outermost because it clears structlog's
+context vars on entry, and `TelemetryMiddleware` sits just inside so the trace
+and span IDs land in the same context the request ID rides in. The telemetry
+middleware opens the server span, records the request counters and histograms,
+and measures time to first token — which is the gap to the first
+`http.response.body` message carrying bytes, and is the one thing no other
+layer can see. Cache outcomes are counted from the outgoing `X-Cache` and
+`X-Semantic-Cache` headers, exactly as the access log reads them, so `cache.py`
+and `semantic.py` stay unaware of being observed (ADR-026, ADR-028). The child
+spans hang off the seams: `routes.py` wraps each cache tier and the provider
+call, `resilience_wrapper.py` opens one span per retry *attempt*, and
+`metering.py` turns each settlement into token and dollar counters.
+
+`compose.yaml`, `Dockerfile` and `deploy/` are the reference deployment:
+gateway, Redis, Prometheus and Grafana, with a provisioned dashboard committed
+as JSON so a change to what "healthy" looks like shows up in a diff, and Jaeger
+behind a `tracing` profile. `scripts/generate_traffic.py` puts a mixed load
+through a running gateway and reads the result back out of `/metrics`.
+
 Still to come (per `pyproject.toml` and the ADR index): PII guardrails, a
 number/unit/entity guard in front of the semantic tier (the step
 `docs/notes/day-10.md` names), and Redis-backed load balancing.
-Breaker state, cache counters and the semantic index are still per worker
-process.
+Breaker state, cache counters, Prometheus counters and the semantic index are
+all per worker process.
 
 ### The src/ layout is load-bearing
 

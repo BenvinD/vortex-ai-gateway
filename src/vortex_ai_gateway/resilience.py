@@ -30,6 +30,8 @@ from typing import Final
 
 import structlog
 
+from vortex_ai_gateway.metrics import BREAKER_STATE, BREAKER_TRANSITIONS
+
 logger = structlog.get_logger(__name__)
 
 #: The one clock every duration in the resilience path is measured against.
@@ -119,6 +121,17 @@ class BreakerState(Enum):
     OPEN = "open"
     HALF_OPEN = "half_open"
 
+    @property
+    def level(self) -> int:
+        """The state as one ordered number, for ``vortex_breaker_state``.
+
+        Ordered rather than arbitrary — 0 closed, 1 half-open, 2 open — so
+        ``max_over_time`` on the gauge answers "was this provider ever
+        refusing traffic in the last hour", which is the question an alert
+        actually asks. A string-valued enum cannot be graphed at all.
+        """
+        return {"closed": 0, "half_open": 1, "open": 2}[self.value]
+
 
 class CircuitBreaker:
     """One provider's breaker: stop calling something that is failing.
@@ -174,6 +187,13 @@ class CircuitBreaker:
             **fields,
         )
         self._state = to
+        # A counter *and* a gauge, because they answer different questions and
+        # neither substitutes for the other: the counter survives the breaker
+        # closing again, so "how often did this flap overnight" is still
+        # answerable in the morning, while the gauge is the only thing that can
+        # say what is happening right now.
+        BREAKER_TRANSITIONS.labels(provider=self.name, state=to.value).inc()
+        BREAKER_STATE.labels(provider=self.name).set(to.level)
 
     def _open(self) -> None:
         """Open the breaker for the current window. Caller must hold the lock."""

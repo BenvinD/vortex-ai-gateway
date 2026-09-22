@@ -1,0 +1,29 @@
+# The virtualenv is built inside the image; copying the host's would ship a
+# Mac's binaries to a Linux container.
+.venv
+.git
+.github
+.idea
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.coverage
+htmlcov
+**/__pycache__
+*.pyc
+
+# Secrets. `.env.example` is deliberately *not* excluded — it documents the
+# knobs and contains no values.
+.env
+
+# Not part of the distribution: the wheel excludes the agent files anyway
+# (see `[tool.hatch.build.targets.wheel]`), and nothing else here is imported
+# at runtime.
+tests
+docs
+scripts
+examples
+deploy
+compose.yaml
+CLAUDE.md
+AGENTS.md

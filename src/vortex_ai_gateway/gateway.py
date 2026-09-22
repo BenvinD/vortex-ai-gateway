@@ -17,7 +17,9 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI, Response, status
 from redis.asyncio import Redis
+from starlette.responses import PlainTextResponse
 
+from vortex_ai_gateway import __version__, metrics
 from vortex_ai_gateway.cache import ResponseCache
 from vortex_ai_gateway.config import Settings, get_settings
 from vortex_ai_gateway.embedding import build_embedder
@@ -25,7 +27,7 @@ from vortex_ai_gateway.error_handling import install_error_handlers
 from vortex_ai_gateway.keys import KeyStore
 from vortex_ai_gateway.logging_config import configure_logging
 from vortex_ai_gateway.metering import Meter
-from vortex_ai_gateway.middleware import RequestIDMiddleware
+from vortex_ai_gateway.middleware import RequestIDMiddleware, TelemetryMiddleware
 from vortex_ai_gateway.pricing import PriceTable
 from vortex_ai_gateway.providers import ChatProvider, MockProvider
 from vortex_ai_gateway.ratelimit import RateLimiter
@@ -33,6 +35,7 @@ from vortex_ai_gateway.routes import create_chat_router
 from vortex_ai_gateway.routing import build_router
 from vortex_ai_gateway.semantic import Embedder, SemanticCache
 from vortex_ai_gateway.spend import SpendLedger
+from vortex_ai_gateway.tracing import configure_tracing, shutdown_tracing
 
 #: A readiness check raises to signal "not ready"; returning means "ok".
 ReadinessCheck = Callable[[], Awaitable[None]]
@@ -75,6 +78,13 @@ def create_app(
     """
     settings = settings or get_settings()
     configure_logging(settings)
+    # Both are process-global and both are idempotent, which is what lets a
+    # factory called once per test get away with calling them. Tracing is
+    # one-way — see `tracing.configure_tracing` — and the label budget is
+    # resized rather than rebuilt unless the number actually changed.
+    owns_tracing = configure_tracing(settings)
+    metrics.configure(label_budget=settings.metrics_label_budget)
+    metrics.BUILD_INFO.labels(version=__version__, environment=settings.environment).set(1)
 
     owns_redis = redis is None and (settings.metering_enabled or settings.cache_enabled)
     if owns_redis:
@@ -106,18 +116,24 @@ def create_app(
     # what decides whether limits and a ledger exist, not whether Redis happens
     # to be reachable.
     metered = connection if settings.metering_enabled else None
+    # Built whether or not there is a ledger to hand it to, because the meter
+    # now prices every settled request for `vortex_cost_usd_total` — a
+    # deployment with no Redis still wants to know what it is spending, and one
+    # table read from one file is the only way the two numbers can agree.
+    prices = PriceTable.from_settings(settings)
     meter = Meter(
         settings,
         limiter=RateLimiter(metered) if metered is not None else None,
         ledger=(
             SpendLedger(
                 metered,
-                PriceTable.from_settings(settings),
+                prices,
                 retention_days=settings.usage_retention_days,
             )
             if metered is not None
             else None
         ),
+        prices=prices,
     )
 
     # Off unless configured, and a working no-op when it is off: a cache with
@@ -154,6 +170,13 @@ def create_app(
         embedder_closer = getattr(built_embedder, "aclose", None)
         if embedder_closer is not None:
             await embedder_closer()
+        # Last, and only for the app that installed the provider: the batch
+        # processor is holding the spans for whatever was happening when this
+        # worker was told to stop, which are the spans most worth having, and
+        # a second app in the same process must not flush them out from under
+        # the first.
+        if owns_tracing:
+            shutdown_tracing()
 
     app = FastAPI(
         title="Vortex AI Gateway",
@@ -173,6 +196,11 @@ def create_app(
     app.state.semantic_cache = semantic_cache
     app.state.redis = connection
 
+    # Order matters and reads backwards: `add_middleware` prepends, so the
+    # *last* one added is the outermost. `RequestIDMiddleware` has to be
+    # outside, because it clears structlog's context vars on entry and would
+    # wipe the trace IDs `TelemetryMiddleware` binds (ADR-026).
+    app.add_middleware(TelemetryMiddleware)
     app.add_middleware(RequestIDMiddleware)
     install_error_handlers(app)
     app.include_router(create_chat_router(provider, meter, cache, semantic_cache))
@@ -195,6 +223,27 @@ def create_app(
         perfectly healthy process and make the outage worse.
         """
         return {"status": "ok"}
+
+    if settings.metrics_enabled:
+
+        @app.get(settings.metrics_path, include_in_schema=False)
+        async def prometheus_metrics() -> PlainTextResponse:
+            """This worker's counters, in the Prometheus text format.
+
+            Open, like the probes above and unlike everything under ``/v1``: a
+            scraper has no API key, and giving it one means the credential that
+            can read your traffic volumes lives in a monitoring system's config
+            (ADR-028). It is safe because it is boring — counts and latencies,
+            never a prompt, a completion or a key — and because the port it is
+            on is expected to be reachable only from inside the network. A
+            gateway exposed directly to the internet should set
+            ``VORTEX_METRICS_ENABLED=false`` and scrape a sidecar instead.
+
+            The numbers are this *worker's*, like the circuit breaker's state
+            and both caches' counters. Run one worker per port.
+            """
+            body, content_type = metrics.render()
+            return PlainTextResponse(content=body, media_type=content_type)
 
     @app.get("/readyz")
     async def readyz(response: Response) -> dict[str, str]:

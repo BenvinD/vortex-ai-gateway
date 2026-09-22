@@ -36,6 +36,8 @@ from vortex_ai_gateway.auth import Principal
 from vortex_ai_gateway.config import Settings
 from vortex_ai_gateway.contracts import ChatCompletionRequest, TokenUsage
 from vortex_ai_gateway.error_handling import RateLimitedError
+from vortex_ai_gateway.metrics import COST, TOKENS, model_label
+from vortex_ai_gateway.pricing import PriceTable
 from vortex_ai_gateway.ratelimit import Decision, RateLimiter, estimate_tokens
 from vortex_ai_gateway.spend import SpendLedger
 
@@ -76,10 +78,19 @@ class Meter:
         *,
         limiter: RateLimiter | None = None,
         ledger: SpendLedger | None = None,
+        prices: PriceTable | None = None,
     ) -> None:
         self.settings = settings
         self.limiter = limiter
         self.ledger = ledger
+        #: Used only to price the Prometheus counters, and independent of the
+        #: ledger on purpose: tokens and dollars are worth graphing on a
+        #: gateway with no Redis behind it, which is most laptops and every
+        #: deployment that wanted a cache but not a limiter. The ledger is
+        #: still the system of record — it stores counts and prices them at
+        #: read time, so a corrected price corrects its history (ADR-022),
+        #: where a counter can only ever be right from here on.
+        self.prices = prices
 
     async def admit(self, principal: Principal, request: ChatCompletionRequest) -> Reservation:
         """Reserve this request's estimated cost, or raise the ``429``.
@@ -139,3 +150,29 @@ class Meter:
                 completion_tokens=usage.completion_tokens if usage else 0,
                 metered=usage is not None,
             )
+        self._count(reservation.model, usage)
+
+    def _count(self, model: str, usage: TokenUsage | None) -> None:
+        """Add this request's tokens and dollars to the Prometheus counters.
+
+        Nothing is counted for an unmetered settlement. A stream nobody has a
+        token count for has no honest number to add, and adding the *estimate*
+        would put a guess on the same graph as the measurements with no way to
+        tell them apart — the ledger publishes unmetered requests separately
+        for exactly that reason, and a counter has no room to.
+
+        A model with no price contributes tokens and no cost, never a zero:
+        ADR-022's rule is that an unpriced model is a gap in the table, and a
+        dollar graph that reads zero for a model in production is the way a new
+        model gets rolled out and billed to nobody.
+        """
+        if usage is None:
+            return
+        label = model_label(model)
+        TOKENS.labels(model=label, kind="prompt").inc(usage.prompt_tokens)
+        TOKENS.labels(model=label, kind="completion").inc(usage.completion_tokens)
+        if self.prices is None:
+            return
+        cost = self.prices.cost(model, usage.prompt_tokens, usage.completion_tokens)
+        if cost is not None:
+            COST.labels(model=label).inc(float(cost))

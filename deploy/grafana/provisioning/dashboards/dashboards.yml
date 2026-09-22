@@ -1,0 +1,14 @@
+apiVersion: 1
+
+providers:
+  - name: vortex
+    orgId: 1
+    folder: Vortex
+    type: file
+    # False, so a dashboard deleted in the UI comes back on restart. The file
+    # in the repository is the dashboard; the browser is a viewer.
+    disableDeletion: false
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

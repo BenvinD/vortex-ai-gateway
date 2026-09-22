@@ -30,9 +30,16 @@ from vortex_ai_gateway.contracts import (
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
+from vortex_ai_gateway.metrics import (
+    FALLBACKS,
+    PROVIDER_ATTEMPTS,
+    PROVIDER_GIVE_UPS,
+    PROVIDER_RETRIES,
+)
 from vortex_ai_gateway.providers.base import ChatProvider
 from vortex_ai_gateway.providers.errors import CircuitOpenError, ProviderError
 from vortex_ai_gateway.resilience import CircuitBreaker, RetryBudget, RetryPolicy, now
+from vortex_ai_gateway.tracing import span
 
 logger = structlog.get_logger(__name__)
 
@@ -41,6 +48,16 @@ logger = structlog.get_logger(__name__)
 RETRY_EVENT: Final = "provider call retried"
 GIVE_UP_EVENT: Final = "provider call failed after retries"
 FALLBACK_EVENT: Final = "provider fallback"
+
+#: Why a retry sequence stopped, as the ``reason`` label on
+#: ``vortex_provider_give_ups_total``. A closed set, so the three ways to give
+#: up stay distinguishable on a graph: running out of attempts is a provider
+#: problem, running out of budget is a *fleet* problem and means the outage is
+#: wider than this request, and running out of deadline means the retries were
+#: never going to finish in time and the policy is mistuned (ADR-001).
+GAVE_UP_EXHAUSTED: Final = "attempts exhausted"
+GAVE_UP_BUDGET: Final = "retry budget exhausted"
+GAVE_UP_DEADLINE: Final = "deadline reached"
 
 
 def _retry_after_of(exc: ProviderError) -> float | None:
@@ -95,13 +112,30 @@ class ResilientProvider:
                 raise await self._refuse()
 
             try:
-                completion = await self.inner.complete(request)
+                # One span per attempt, not per request: three spans under one
+                # `provider.complete` parent is what a retry storm looks like,
+                # and it is the picture Day 5's log lines were describing.
+                with span(
+                    "provider.attempt",
+                    {
+                        "vortex.provider": self.name,
+                        "vortex.attempt": attempt + 1,
+                        "vortex.max_attempts": self.policy.max_attempts,
+                    },
+                ):
+                    completion = await self.inner.complete(request)
             except asyncio.CancelledError:
                 # The caller went away. Hand back a half-open trial slot without
                 # blaming the upstream, then let the cancellation carry on.
+                PROVIDER_ATTEMPTS.labels(provider=self.name, outcome="cancelled").inc()
                 await self.breaker.release_trial()
                 raise
             except ProviderError as exc:
+                # Counted before the retryable check, because the point of this
+                # counter is how many times the upstream was *called*: divided
+                # into `vortex_requests_total` it is the amplification factor,
+                # and a non-retryable failure still cost one call.
+                PROVIDER_ATTEMPTS.labels(provider=self.name, outcome="error").inc()
                 if not exc.retryable:
                     # The caller's own bad request, our bad key, a body we
                     # cannot read. None of these say the provider is unhealthy,
@@ -111,6 +145,7 @@ class ResilientProvider:
                 if not await self._should_retry(exc, attempt, started, deadline):
                     break
             else:
+                PROVIDER_ATTEMPTS.labels(provider=self.name, outcome="ok").inc()
                 await self.breaker.record_success()
                 return completion
 
@@ -125,6 +160,7 @@ class ResilientProvider:
             error=type(last_exc).__name__,
             code=last_exc.code,
         )
+        PROVIDER_GIVE_UPS.labels(provider=self.name, reason=GAVE_UP_EXHAUSTED).inc()
         raise last_exc
 
     async def _should_retry(
@@ -144,9 +180,10 @@ class ResilientProvider:
             logger.warning(
                 GIVE_UP_EVENT,
                 provider=self.name,
-                reason="retry budget exhausted",
+                reason=GAVE_UP_BUDGET,
                 error=type(exc).__name__,
             )
+            PROVIDER_GIVE_UPS.labels(provider=self.name, reason=GAVE_UP_BUDGET).inc()
             return False
 
         # The provider's own Retry-After beats our arithmetic: a policy that
@@ -165,10 +202,11 @@ class ResilientProvider:
                 logger.warning(
                     GIVE_UP_EVENT,
                     provider=self.name,
-                    reason="deadline reached",
+                    reason=GAVE_UP_DEADLINE,
                     error=type(exc).__name__,
                     remaining_s=round(max(0.0, remaining), 3),
                 )
+                PROVIDER_GIVE_UPS.labels(provider=self.name, reason=GAVE_UP_DEADLINE).inc()
                 return False
 
         logger.info(
@@ -182,6 +220,10 @@ class ResilientProvider:
             code=exc.code,
             status=exc.status_code,
         )
+        # Counted here and not at the top of the function: everything above
+        # this line is a reason *not* to retry, so a counter set earlier would
+        # report retries that never happened.
+        PROVIDER_RETRIES.labels(provider=self.name, error=type(exc).__name__).inc()
         await asyncio.sleep(sleep_for)
         return True
 
@@ -245,6 +287,7 @@ class FallbackProvider:
                     code=exc.code,
                     chain_position=position + 1,
                 )
+                FALLBACKS.labels(from_provider=provider.name, to_provider=remaining[0].name).inc()
 
         if last_exc is None:  # pragma: no cover - the loop cannot end without one
             raise ValueError("a fallback chain needs at least one provider")
