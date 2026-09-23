@@ -215,11 +215,12 @@ class Settings(BaseSettings):
     service_name: str = "vortex-ai-gateway"
 
     # Turns on the OpenTelemetry SDK (ADR-026). Off by default, and off costs
-    # nothing rather than a little: with no SDK installed the OTel API hands
-    # back a no-op tracer, so the `span()` calls at the cache, provider and
-    # retry seams stay in the code path and do nothing at all. On, spans go to
-    # an OTLP collector — one trace per request, with a child span per cache
-    # tier, per provider call and per retry attempt.
+    # nothing — but only because `tracing.span` is written to make that true.
+    # A no-op *tracer* is not free: it still builds context managers, and four
+    # spans a request measured 16% of the request before `span()` learned to
+    # return early (ADR-029). On, spans go to an OTLP collector — one trace per
+    # request, with a child span per cache tier, per provider call and per
+    # retry attempt.
     tracing_enabled: bool = False
 
     # Where spans go. `otlp` speaks OTLP over HTTP to a collector; `console`

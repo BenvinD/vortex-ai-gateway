@@ -93,6 +93,90 @@ def test_there_is_no_trace_context_outside_a_span() -> None:
     assert trace_context() == {}
 
 
+# --- the seam costs nothing switched off -----------------------------------
+#
+# `_provider` is monkeypatched to None rather than relied on, because the
+# `_exporter` fixture installs a provider for the whole session and these tests
+# are about the state a gateway with tracing *off* is in. Patching the module
+# global is what the shutdown tests already do, and for the same reason.
+
+
+@pytest.fixture
+def untraced(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A process in which nothing has ever installed a tracer provider."""
+    monkeypatch.setattr("vortex_ai_gateway.tracing._provider", None)
+
+
+def test_a_span_with_no_provider_is_not_recording(untraced: None) -> None:
+    with span("probe", {"vortex.cache.tier": "exact"}) as current:
+        assert current.is_recording() is False
+
+
+def test_a_span_with_no_provider_allocates_nothing(untraced: None) -> None:
+    """The same object every time, which is the whole point of the fast path.
+
+    A generator-based context manager is a fresh object per call plus three
+    frames to enter and leave it; four of those per request measured 16% of the
+    request (docs/notes/day-13.md). Identity here is what says that cost is gone
+    rather than merely smaller.
+    """
+    assert span("one") is span("two", {"a": "b"})
+
+
+def test_the_attributes_are_not_even_walked_when_nothing_is_tracing(
+    untraced: None,
+) -> None:
+    """The short-circuit happens before the mapping is touched.
+
+    Asserted with a mapping that raises rather than by timing it: an
+    implementation that built the filtered dict and *then* discovered there was
+    nothing to give it to would pass every other test in this section while
+    keeping most of the cost.
+    """
+
+    class Explosive(dict[str, str]):
+        def items(self) -> object:
+            raise AssertionError("the attribute mapping was walked with no provider installed")
+
+    with span("probe", Explosive(never="read")):
+        pass
+
+
+def test_the_inert_span_takes_what_the_call_sites_do_to_it(untraced: None) -> None:
+    """Every method any seam calls, on the object they get when tracing is off.
+
+    `middleware.py` calls `update_name` unconditionally — it is not behind the
+    `is_recording()` guard the attribute writes are behind — so "it is never
+    touched" is not true and must not become the assumption this rests on.
+    """
+    with span("probe") as current:
+        current.update_name("renamed")
+        current.set_attribute("vortex.cache.outcome", "MISS")
+        current.set_status(StatusCode.ERROR, "HTTP 502")
+
+
+def test_the_inert_span_does_not_swallow_an_exception(untraced: None) -> None:
+    """__exit__ returns False, never None.
+
+    The seams wrap the provider call and both cache tiers. A context manager
+    that suppressed what they raise would turn a 502 into a 200 with no body,
+    which is the worst failure available to a no-op.
+    """
+    with pytest.raises(ProviderUnavailable, match="upstream is down"):
+        with span("probe"):
+            raise ProviderUnavailable("upstream is down", provider="openai")
+
+
+def test_a_span_still_records_once_a_provider_is_installed(
+    spans: InMemorySpanExporter,
+) -> None:
+    """The other half of the fast path: it must stop applying when tracing is on."""
+    with span("probe", {"kept": "yes"}) as current:
+        assert current.is_recording() is True
+
+    assert dict(only(spans, "probe").attributes or {}) == {"kept": "yes"}
+
+
 # --- the server span -------------------------------------------------------
 
 

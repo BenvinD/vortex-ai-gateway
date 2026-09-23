@@ -527,3 +527,126 @@ carry the most:
 > uv run python scripts/generate_traffic.py --requests 2000 --delay 0.05
 > open http://localhost:3000   # screenshot it, and replace this note
 > ```
+>
+> For a screenshot *under load* rather than under a trickle — which is the one
+> worth having, since the latency and TTFT panels are flat lines at this
+> volume — point the benchmark suite at the compose stack instead, and grab the
+> dashboard while the run is in flight:
+>
+> ```bash
+> BENCH_URL=http://localhost:8000 BENCH_DURATION=5m BENCH_VUS=64 \
+>   k6 run bench/baseline.js &
+> open http://localhost:3000
+> ```
+
+## Benchmarks
+
+`bench/` holds four k6 workloads, a runner that sweeps two configuration axes,
+and a reporter that prints the table below. `bench/README.md` is the
+methodology in full; the short version is four questions:
+
+| Workload | Question |
+|---|---|
+| `baseline.js` | What does *our* code cost? Unique prompts so the cache always misses, against the mock provider, which answers with no network and no sleep. What is left is two ASGI middlewares, auth, admission, a cache lookup that hashes and misses, validation and serialisation — **the denominator for every other number here.** |
+| `cache-hit.js` | What does the exact tier save? A warmed prompt pool, and the number that matters is the **p99 of a hit**: a cache whose median is a hash and whose tail is a Redis timeout has moved the variance, not removed a provider call. |
+| `streaming.js` | Is the streamed path the same service? It runs through `StreamingResponse`, the per-chunk accounting, the usage chunk that ADR-018 strips, and a settlement in a `finally` — none of which the buffered path touches. |
+| `provider-failure.js` | Does a dead vendor cost anything it shouldn't? One provider pointed at a blackholed address, driven open-loop, while a steady trickle of `GET /v1/usage` runs alongside. **The bystander's p99 is the assertion**: if it degrades in step with the storm, one dead vendor is a whole-gateway outage. |
+
+Two axes, because they are the ones a deployment actually chooses and the ones
+the code does not answer by inspection: **1 worker vs 4** — breaker state, cache
+counters, the Prometheus registry and the semantic index are all per worker
+process, and only Redis is shared — and **the semantic tier off vs on**, which
+costs an embedding call on every exact-tier miss.
+
+```bash
+bench/run-matrix.sh
+uv run bench/report.py bench/results/<timestamp>
+```
+
+| Workload | Workers | Semantic | p50 | p95 | p99 | RPS | Errors |
+|---|---|---|---|---|---|---|---|
+| baseline | 1 | off | — | — | — | — | — |
+| baseline | 4 | off | — | — | — | — | — |
+| cache-hit | 1 | off | — | — | — | — | — |
+| cache-hit | 4 | off | — | — | — | — | — |
+| streaming | 1 | off | — | — | — | — | — |
+| streaming | 4 | off | — | — | — | — | — |
+| provider-failure | 1 | off | — | — | — | — | — |
+| provider-failure | 4 | off | — | — | — | — | — |
+| baseline | 1 | on | — | — | — | — | — |
+| cache-hit | 1 | on | — | — | — | — | — |
+
+> **The matrix has not been run.** k6 is not installed on the machine this was
+> built on, so every cell above is empty, and it is empty rather than estimated.
+> The scripts are written, they parse, and `report.py` is tested against a
+> fixture of the summary shape k6 emits — but a table of plausible numbers for a
+> load test nobody ran would be the most convincing untrue thing in this
+> repository, which is the same rule the dashboard note below follows. One
+> command fills it in, and the row order above is the order `report.py` prints.
+
+### What *has* been measured, and how
+
+The numbers in the next section come from a different instrument, and the
+difference matters: they drive `create_app()`'s ASGI callable directly, in one
+process, with no HTTP client and no socket in the measurement. That isolates the
+gateway's own code — which is the question a bottleneck hunt asks — and it is
+**not** a substitute for the table above, because it cannot produce a queue, a
+second worker, or an error rate. Configuration: buffered `POST
+/v1/chat/completions` at a 64-word prompt, the mock provider, `/metrics` live,
+tracing off, no Redis, `log_level=INFO` so the access-log line is written.
+Reported as the minimum of nine runs of 8,000 requests, after a 300-request
+warmup.
+
+### The bottleneck: instrumentation that was not free switched off
+
+ADR-026 put spans at the cache tiers, the provider call and every retry attempt,
+unconditionally, on the grounds that the OpenTelemetry API is a no-op until an
+SDK provider is installed and so costs nothing when tracing is off. Nobody had
+measured it. It was wrong, and not marginally:
+
+| | µs / request | req/s, one process |
+|---|---|---|
+| before | 158.5 | 6,307 |
+| after | 131.1 | 7,649 |
+| | **−17.3%** | **+21.3%** |
+
+`NoOpTracer.start_as_current_span` is a `@contextmanager`, the `use_span` inside
+it is another, and `tracing.span` wrapped both in a third — so four spans per
+request meant twelve generator context managers built, entered and unwound on
+every request of every default deployment. The fix is in the module that owns
+the seam's API rather than at its six call sites: with no provider installed,
+`span()` returns one shared, stateless context manager that yields
+`trace.INVALID_SPAN`, which is already a real `Span` whose `is_recording()` is
+`False` and whose setters are no-ops. The test is `_provider is None` — set at
+most once per process by `configure_tracing`, and never back — so the seam costs
+an `is None` test. ADR-029 records it, and the claims in `config.py` and
+`AGENTS.md` that said "costs nothing" now say *why* it costs nothing.
+
+Two of the tests pin the optimisation rather than the behaviour, because
+behaviour is unchanged and a correct-but-slow implementation would pass
+everything else: one asserts `span()` hands back the *same object* twice, and one
+passes it an attribute mapping that raises if it is walked. A third asserts
+`__exit__` returns `False` — a no-op that swallowed a provider failure would turn
+a 502 into a 200 with no body.
+
+Two candidates that were measured and *not* fixed, for the record:
+
+* **Double JSON serialisation.** `routes.py` builds every response twice — once
+  as a Python dict via `model_dump(mode="json")`, then again as bytes inside
+  `JSONResponse` — where `model_dump_json()` does it in one pass, byte for byte
+  identically (checked). It is 2.0x faster on a 378-byte response and 3.0x on a
+  4.3 KB one, but that is 3–10 µs against a 131 µs request: real, and not the
+  bottleneck. Worth doing when the response gets large, which is what
+  `max_completion_tokens` at 4096 does.
+* **The access log.** Writing one JSON line per request costs 6–17 µs depending
+  on the run, roughly 10% of a request. That is not overhead, it is the feature —
+  `RequestIDMiddleware`'s completion line is how a hit rate becomes a log query —
+  and the way to pay less for it is `VORTEX_LOG_LEVEL`, not a code change.
+
+The `bench/` suite would find a third class this instrument cannot: the semantic
+tier's `VectorIndex` appends a row and retains the whole response for every miss,
+per namespace, with no eviction and no TTL, while `nearest()` is a full
+matrix-vector product over the live rows. On caller-supplied traffic both memory
+and lookup cost grow without bound — the same shape of problem ADR-027 caps for
+metric labels, in a tier that is off by default (ADR-005) and would need this
+answered before it is turned on.

@@ -1,0 +1,11 @@
+# Benchmark output is a measurement of one machine at one moment, not a
+# reproducible artefact: a k6 summary carries the host's CPU count and the
+# wall-clock latencies that follow from it, so committing runs would grow the
+# repository with data that is only meaningful next to the manifest it came
+# with. The numbers worth keeping are transcribed into README.md and
+# docs/notes/, with their methodology, deliberately and by hand.
+#
+# This file is committed so the directory exists and `run-matrix.sh` can write
+# into it on a fresh clone.
+*
+!.gitignore

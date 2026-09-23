@@ -7,12 +7,18 @@ which adds a task hop and does not survive contact with a streaming response
 whose ending taxonomy is the most carefully built thing in this codebase
 (ADR-018, ADR-019, ADR-026).
 
-Nothing here needs to be switched off to be cheap. The OpenTelemetry *API* is
-a no-op implementation until an SDK provider is installed, so
-:func:`span` around a cache lookup costs a couple of attribute lookups on a
-gateway that has never heard of a collector, and every module below can be
-instrumented unconditionally. :func:`configure_tracing` is what installs the
-real thing, and it is the only place in ``src/`` that touches the SDK.
+Every module below is instrumented unconditionally, and :func:`span` is what
+makes that free rather than merely cheap. The OpenTelemetry *API* is a no-op
+implementation until an SDK provider is installed — but a no-op is not the same
+as nothing: ``start_as_current_span`` on a no-op tracer still builds two
+generator-based context managers, and this module's own wrapper made three.
+Four spans a request at three context managers each measured **25.7 us per
+request, 15.9% of the total**, on a gateway with tracing switched off
+(docs/notes/day-13.md). So :func:`span` short-circuits: with no provider
+installed it returns one shared, stateless context manager that yields
+``trace.INVALID_SPAN``, and the seams cost an ``is None`` test.
+:func:`configure_tracing` is what installs the real thing, and it is the only
+place in ``src/`` that touches the SDK.
 
 Two things are deliberately *not* here. There is no metrics exporter — the
 gateway publishes a Prometheus endpoint instead, because a scrape needs no
@@ -26,8 +32,8 @@ same context vars the request ID rides in.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager
-from typing import TYPE_CHECKING, Final
+from contextlib import AbstractContextManager, contextmanager
+from typing import TYPE_CHECKING, Final, Literal
 
 import structlog
 from opentelemetry import trace
@@ -51,6 +57,7 @@ from vortex_ai_gateway import __version__
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from types import TracebackType
 
     from opentelemetry.util.types import AttributeValue
 
@@ -174,8 +181,45 @@ def tracer() -> trace.Tracer:
     return trace.get_tracer(TRACER_NAME)
 
 
-@contextmanager
-def span(name: str, attributes: Attributes | None = None) -> Iterator[Span]:
+class _InertSpan:
+    """The context manager :func:`span` returns when nothing is tracing.
+
+    Stateless, so one instance serves the whole process and entering it
+    allocates nothing. It yields ``trace.INVALID_SPAN`` rather than a stub of
+    its own: that is a real :class:`~opentelemetry.trace.Span` whose
+    ``is_recording()`` is ``False`` and whose setters are already no-ops, so a
+    call site needs no guard it did not already have, and ``trace_context()``
+    keeps returning nothing because an invalid span context is exactly what it
+    checks for.
+
+    It deliberately does **not** attach that span to the current context.
+    Nothing is reading it — ``get_current_span`` already answers
+    ``INVALID_SPAN`` when no span is active — and attaching it is most of what
+    the real path costs.
+    """
+
+    __slots__ = ()
+
+    def __enter__(self) -> Span:
+        return trace.INVALID_SPAN
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        # False, never None: this must not swallow an exception raised inside a
+        # seam it is only observing.
+        return False
+
+
+#: The one instance. Module-level because `span()` is on every request's path
+#: four times over, and the point of this object is to allocate nothing.
+_INERT: Final = _InertSpan()
+
+
+def span(name: str, attributes: Attributes | None = None) -> AbstractContextManager[Span]:
     """Run a block inside a child span, dropping attributes that are ``None``.
 
     Attributes come in as a mapping rather than as keyword arguments because
@@ -186,7 +230,22 @@ def span(name: str, attributes: Attributes | None = None) -> Iterator[Span]:
     warning for each one it is handed, so call sites pass optional values
     straight through and let this drop them; the alternative is the same dict
     comprehension written out at every seam.
+
+    **With no provider installed this returns immediately**, before the name is
+    used or the attribute mapping is walked — see :class:`_InertSpan` and the
+    module docstring for what that is worth. ``_provider`` is the right thing to
+    test rather than asking OpenTelemetry for its global on every request:
+    :func:`configure_tracing` is the only place in ``src/`` that installs one
+    and it is one-way, so this flips at most once per process and never back.
     """
+    if _provider is None:
+        return _INERT
+    return _recording_span(name, attributes)
+
+
+@contextmanager
+def _recording_span(name: str, attributes: Attributes | None) -> Iterator[Span]:
+    """The real thing: a child span of whatever is current."""
     with tracer().start_as_current_span(
         name,
         attributes=({k: v for k, v in attributes.items() if v is not None} if attributes else None),

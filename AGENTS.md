@@ -134,9 +134,13 @@ comes out of a request body, and an uncapped label is a time series a caller
 allocates and nothing ever frees (ADR-027). `tracing.py` is the only module
 that touches the OpenTelemetry SDK, and the API it exposes — `span()`,
 `trace_context()` — is a no-op until `VORTEX_TRACING_ENABLED` installs a
-provider, so the instrumentation at the seams is unconditional and costs
-nothing switched off. `configure_tracing` returns *ownership*, not liveness,
-because OTel's provider is a process global that refuses replacement.
+provider, so the instrumentation at the seams is unconditional. Switched off it
+costs one `is None` test, and that is a thing `span()` does deliberately rather
+than a property of the OTel API: a no-op *tracer* still builds two generator
+context managers per span, and four spans a request was 16% of the request
+until `span()` learned to return a shared inert one (ADR-029, `bench/`).
+`configure_tracing` returns *ownership*, not liveness, because OTel's provider
+is a process global that refuses replacement.
 
 `middleware.py` now holds two raw-ASGI middlewares and their order is
 load-bearing: `RequestIDMiddleware` is outermost because it clears structlog's
