@@ -42,3 +42,71 @@ jobs:
 
       - name: Tests (pytest)
         run: uv run --no-sync pytest -v
+
+  # The container and the stack, which the job above never touches. Nothing on
+  # a laptop without Docker can prove the Dockerfile builds, that the image
+  # runs as the unprivileged user it declares, or that every service in
+  # compose.yaml reaches healthy — so this job is where that gets proved.
+  docker:
+    runs-on: ubuntu-latest
+    env:
+      VORTEX_TRACING_ENABLED: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t vortex-ai-gateway:ci .
+
+      - name: Image runs as non-root
+        run: |
+          uid=$(docker run --rm --entrypoint id vortex-ai-gateway:ci -u)
+          echo "uid=$uid"
+          test "$uid" = "10001"
+
+      # `--wait` returns only when every service's healthcheck passes, and
+      # fails the step if one goes unhealthy — which is the assertion.
+      - name: Start the full stack (with tracing)
+        run: docker compose --profile tracing up -d --build --wait --wait-timeout 180
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Send mixed traffic
+        run: uv run scripts/generate_traffic.py --requests 200
+
+      - name: Prometheus is scraping the gateway
+        run: |
+          for _ in $(seq 1 12); do
+            up=$(curl -fsS 'http://localhost:9090/api/v1/query?query=up%7Bjob%3D%22vortex-gateway%22%7D' \
+              | jq -r '.data.result[0].value[1] // "0"')
+            [ "$up" = "1" ] && { echo "gateway target up"; exit 0; }
+            sleep 5
+          done
+          echo "gateway target never reported up" >&2
+          exit 1
+
+      - name: Grafana and Jaeger answer
+        run: |
+          curl -fsS http://localhost:3000/api/health
+          curl -fsS http://localhost:8000/readyz
+          # Spans leave in batches, so the service can lag the traffic by a few
+          # seconds.
+          for _ in $(seq 1 12); do
+            curl -fsS http://localhost:16686/api/services \
+              | jq -e '.data // [] | index("vortex-ai-gateway")' >/dev/null \
+              && { echo "jaeger has traces"; exit 0; }
+            sleep 5
+          done
+          echo "no vortex-ai-gateway traces in jaeger" >&2
+          exit 1
+
+      - name: Stack logs
+        if: failure()
+        run: docker compose --profile tracing logs --no-color
+
+      - name: Tear down
+        if: always()
+        run: docker compose --profile tracing down -v

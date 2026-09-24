@@ -111,16 +111,15 @@ export const options = {
     // Not asserted, reported: how the storm was answered is the finding, and a
     // threshold on it would encode today's breaker settings as a requirement.
   },
-  // The default callback marks every 5xx as a failed request, which would make
-  // `http_req_failed` on this workload a constant 1.0 carrying no information.
-  // Here a 502, a 503 and a 504 are expected answers; anything else is not.
-  responseCallback: http.expectedStatuses(
-    { min: 200, max: 299 },
-    502,
-    503,
-    504
-  ),
 };
+
+// The default callback marks every 5xx as a failed request, which would make
+// `http_req_failed` on this workload a constant 1.0 carrying no information.
+// Here a 502, a 503 and a 504 are expected answers; anything else is not. Set in
+// the init context, because k6 does not read `responseCallback` out of
+// `options` — it warns "unknown field" and ignores it, which is how the first
+// published run counted the whole storm as failures.
+http.setResponseCallback(http.expectedStatuses({ min: 200, max: 299 }, 502, 503, 504));
 
 export function storm() {
   const res = http.post(BASE_URL + CHAT_PATH, body(BROKEN_MODEL, uniquePrompt()), {
