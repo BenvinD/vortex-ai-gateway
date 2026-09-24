@@ -4,6 +4,8 @@ Every ``Settings`` here is built with ``_env_file=None`` so a developer's real
 ``.env`` cannot influence the result; environment is controlled via monkeypatch.
 """
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -65,3 +67,21 @@ def test_get_settings_is_cached() -> None:
     get_settings.cache_clear()
     assert get_settings() is get_settings()
     get_settings.cache_clear()
+
+
+README = Path(__file__).resolve().parents[1] / "README.md"
+
+
+def test_readme_configuration_reference_names_every_setting() -> None:
+    # The table is hand-written, so a new field is one nobody remembers to add.
+    # Reads the section, not the whole file: a variable mentioned in passing
+    # elsewhere is not a reference entry.
+    text = README.read_text(encoding="utf-8")
+    section = text.split("## Configuration reference", 1)[1].split("\n## ", 1)[0]
+    prefix = Settings.model_config["env_prefix"]
+    missing = [
+        f"{prefix}{name.upper()}"
+        for name in Settings.model_fields
+        if f"`{prefix}{name.upper()}`" not in section
+    ]
+    assert missing == []

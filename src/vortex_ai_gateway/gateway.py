@@ -180,7 +180,7 @@ def create_app(
 
     app = FastAPI(
         title="Vortex AI Gateway",
-        version="0.1.0",
+        version=__version__,
         description="Multi-provider LLM gateway with routing and guardrails",
         lifespan=lifespan,
     )

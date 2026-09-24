@@ -76,6 +76,16 @@ services:
       VORTEX_TRACING_EXPORTER: otlp
       VORTEX_TRACING_ENDPOINT: http://jaeger:4318/v1/traces
       VORTEX_SERVICE_NAME: vortex-ai-gateway
+    # Liveness is the image's own HEALTHCHECK (the Dockerfile says why it is
+    # `/healthz`); restated here only so `docker compose ps` and `--wait` read
+    # the same probe on an image built from an older Dockerfile.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
@@ -92,8 +102,15 @@ services:
       # Needed by Grafana's "Explore" and by anything that wants to reload the
       # config without restarting the container.
       - --web.enable-lifecycle
+    # The image is busybox-based, so `wget` is there and `curl` is not.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
     depends_on:
-      - gateway
+      gateway:
+        condition: service_healthy
 
   grafana:
     image: grafana/grafana:11.3.0
@@ -113,8 +130,15 @@ services:
       # nobody can review and nobody else gets.
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
     depends_on:
-      - prometheus
+      prometheus:
+        condition: service_healthy
 
   jaeger:
     # Traces, under a profile so the default stack stays the four services the
@@ -125,6 +149,12 @@ services:
     image: jaegertracing/all-in-one:1.62.0
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
+    # 14269 is the admin port; its root answers 200 once the collector is up.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:14269/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
     ports:
       - "16686:16686"  # UI
       - "4318:4318"    # OTLP/HTTP, which is what `tracing.py` speaks

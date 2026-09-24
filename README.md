@@ -1,24 +1,140 @@
 # vortex-ai-gateway
 
-**v0.3**
+[![CI](https://github.com/BenvinD/vortex-ai-gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/BenvinD/vortex-ai-gateway/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/BenvinD/vortex-ai-gateway?sort=semver)](https://github.com/BenvinD/vortex-ai-gateway/releases)
+[![Python 3.14](https://img.shields.io/badge/python-3.14-3776ab.svg)](.python-version)
+[![mypy: strict](https://img.shields.io/badge/mypy-strict-2a6db2.svg)](pyproject.toml)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-## What is This?
+**v0.1.0** ([changelog](CHANGELOG.md)) · An OpenAI-compatible gateway that sits between your applications
+and the model vendors: one endpoint, one key per caller, and the routing,
+limits, caching, retries and telemetry done once instead of in every client.
 
-vortex-ai-gateway is an AI Gateway designed to serve as a unified control plane and routing hub for AI model interactions. It manages request flow, handles authentication, orchestrates model selection, and provides a centralized entry point for AI applications.
+## What and why
 
-[`docs/architecture.md`](docs/architecture.md) walks one request through every
-layer — auth, limits, cache, routing, resilience, adapter — with the decision
-behind each and the condition under which it was the wrong one.
+Every team that calls an LLM ends up writing the same five things around the
+call: which vendor gets which model, a retry loop that does not make an outage
+worse, a limit on what one caller can spend, a cache for the question that was
+already answered, and a way to see what any of it cost. Written per client,
+they disagree with each other and nobody sees the total.
 
-## About the Name
+vortex-ai-gateway is those five things in one process, behind the OpenAI wire
+format, so an existing client changes its base URL and nothing else:
 
-**Vortex** — A vortex represents a center of concentrated activity and convergence. In fluid dynamics, a vortex is where multiple flows merge into a cohesive center. We chose this name because a gateway should act as a convergence point—drawing together multiple AI requests, models, and services, then directing them intelligently through a unified system.
+| | |
+|---|---|
+| **Routing** | `model` in the request picks the vendor — OpenAI, Anthropic or Ollama — from an ordered glob table |
+| **Resilience** | per-provider retries with jitter, a circuit breaker each, ordered fallback chains |
+| **Keys and limits** | hashed, revocable per-caller keys; per-key RPM/TPM token buckets in one Redis Lua script |
+| **Cost** | a usage ledger in tokens, priced at read time; streams are metered even when the caller did not ask |
+| **Cache** | an exact response cache per tenant, and an optional semantic tier behind it |
+| **Telemetry** | Prometheus metrics, OpenTelemetry traces, JSON logs, all keyed by one request ID |
 
-**AI Gateway** — Self-explanatory. A gateway in networking and systems design controls and directs traffic between different domains. An AI Gateway specifically manages traffic and interactions with artificial intelligence systems.
+Everything except routing and metrics is off by default, so a checkout with no
+Redis and no vendor keys runs end to end on the built-in mock provider.
 
-Together, **vortex-ai-gateway** evokes both the convergence point metaphor and the explicit purpose of the system.
+## Quickstart
 
-## Getting Started
+Two paths. Both need no vendor keys: with no routing table, the gateway answers
+from its mock provider.
+
+### The whole stack (Docker, about 5 minutes)
+
+Gateway, Redis, Prometheus, Grafana and Jaeger, all healthy, with mixed traffic
+already on the dashboard:
+
+```bash
+git clone https://github.com/BenvinD/vortex-ai-gateway.git && cd vortex-ai-gateway
+make demo          # needs Docker and uv
+```
+
+Then open Grafana at <http://localhost:3000> (dashboard *Vortex AI Gateway*),
+traces at <http://localhost:16686>, and the API docs at
+<http://localhost:8000/docs>. `make demo-down` stops it.
+
+### Just the gateway (no Docker, about 2 minutes)
+
+```bash
+uv sync
+uv run uvicorn vortex_ai_gateway.gateway:app
+```
+
+```bash
+curl -s localhost:8000/v1/chat/completions \
+  -H 'Authorization: Bearer any-key' -H 'Content-Type: application/json' \
+  -d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Say hello"}]}'
+```
+
+```json
+{"id": "chatcmpl-mock-001", "object": "chat.completion", "model": "gpt-4o-mini",
+ "choices": [{"index": 0, "message": {"role": "assistant", "content": "mock reply to: Say hello"},
+              "finish_reason": "stop"}],
+ "usage": {"prompt_tokens": 2, "completion_tokens": 5, "total_tokens": 7},
+ "vortex": {"provider": "mock", "upstream_model": "gpt-4o-mini"}}
+```
+
+Any OpenAI SDK works unchanged against it:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="any-key")
+print(client.chat.completions.create(
+    model="gpt-4o-mini", messages=[{"role": "user", "content": "Say hello"}]
+).choices[0].message.content)
+```
+
+To reach a real vendor, add a route and its key (see
+[Provider routing](#provider-routing)), for example
+`VORTEX_MODEL_ROUTES=gpt-*=openai` and `VORTEX_OPENAI_API_KEY=sk-...`.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    client([Client<br/>any OpenAI SDK])
+
+    subgraph gw["vortex-ai-gateway"]
+        direction LR
+        edge["Edge<br/>request ID · telemetry<br/>auth → Principal · validation"]
+        admit["Meter.admit<br/>RPM + TPM"]
+        cache{"Exact cache<br/>→ semantic tier"}
+        router["Router<br/>model → provider"]
+        res["Resilience<br/>retry · breaker · fallback"]
+        adapter["Adapter<br/>OpenAI · Anthropic · Ollama · mock"]
+        settle["Meter.settle<br/>ledger · cache store"]
+    end
+
+    upstream([Vendor APIs])
+    redis[("Redis")]
+    obs[("Prometheus · Jaeger")]
+
+    client --> edge --> admit --> cache
+    cache -- hit --> settle
+    cache -- miss --> router --> res --> adapter --> upstream
+    upstream --> settle --> client
+    admit -.-> redis
+    cache -.-> redis
+    settle -.-> redis
+    gw -.-> obs
+```
+
+A request is authenticated to a `Principal` whose public `key_id` everything
+downstream is keyed on; admitted against its rate limits *before* a provider is
+touched; looked up in the cache; routed by model name; wrapped in retries and a
+breaker; translated to the vendor's format by one adapter; and settled against
+the ledger with the tokens it actually used. Streams take the same path, bypass
+the cache, and settle when the stream ends — including when the client hangs
+up, which also closes the upstream.
+
+[`docs/architecture.md`](docs/architecture.md) walks the same path box by box,
+with the ADR behind each one and the condition under which the rejected
+alternative would win. The decisions themselves are indexed in
+[`docs/adr/`](docs/adr/README.md).
+
+## Running and configuring
 
 This project uses [uv](https://docs.astral.sh/uv/) for dependency management.
 Python 3.14 is pinned in `.python-version`.
@@ -108,10 +224,11 @@ one that costs money with nothing to show for it. See ADR-018 and ADR-019.
 ### Running the Application
 
 ```bash
-uv run uvicorn vortex_ai_gateway.gateway:app --reload
+uv run uvicorn vortex_ai_gateway.gateway:app --reload   # or: make run
 ```
 
-The server will be available at `http://localhost:8000`
+The server will be available at `http://localhost:8000`, with interactive API
+docs at `/docs`. `/healthz` is liveness, `/readyz` is readiness (ADR-006).
 
 ### Logging
 
@@ -125,6 +242,9 @@ threshold.
 ### Development
 
 ```bash
+make check               # everything CI's test job runs, in CI's order
+make help                # the other targets
+
 uv run pytest            # tests with coverage
 uv run ruff check src tests   # lint
 uv run ruff format src tests  # format
@@ -144,6 +264,7 @@ bench/                    # k6 workloads, the matrix runner, the report (see Ben
 docs/design|adr|notes/    # the paper trail: before, decided, after
 deploy/                   # Prometheus config, Grafana provisioning, the dashboard JSON
 compose.yaml, Dockerfile  # the reference stack (see Observability)
+Makefile                  # one-word entry points: demo, check, run, image
 ```
 
 The `src/` layout is deliberate. Tests import `vortex_ai_gateway` from the
@@ -168,11 +289,13 @@ Every push and pull request runs, in order:
 `--locked` fails the build if `uv.lock` is out of step with `pyproject.toml`,
 so dependency changes cannot land without a matching lockfile update.
 
+A second job, `docker`, proves what the first cannot: it builds the image,
+checks the container runs as UID 10001 rather than root, brings up the full
+compose stack with `--wait` (which fails if any service's healthcheck does),
+sends mixed traffic, and asserts that Prometheus is scraping the gateway and
+Jaeger has its traces.
+
 The `main` branch requires these checks to pass and a pull request review.
-
-## License
-
-Licensed under the Apache License 2.0. See LICENSE file for details.
 
 ## Resilience
 
@@ -533,9 +656,10 @@ carry the most:
 > so the images came from `mirror.gcr.io`, and the gateway image was built from
 > a copy of the `Dockerfile` with two changes: a local stand-in for the
 > `ghcr.io/astral-sh/uv` base (same Python and Debian, uv from PyPI), and the
-> `curl` install swapped for a Python one-liner health check. The committed
-> `Dockerfile` itself has still not been built unmodified. Its
-> `uv sync --locked --no-editable` step did run and passed.
+> `curl` install swapped for a Python one-liner health check. That second
+> change has since been made in the committed `Dockerfile` too, and CI's
+> `docker` job now builds it unmodified and brings the stack up to healthy on
+> every push, so the base image is the only remaining difference.
 >
 > Three things that read like bugs on the dashboard and are not: **Error rate**
 > counts only 5xx, so 429s and 4xx never move it; **Breakers open** shows the
@@ -687,23 +811,21 @@ it is written to. They are configured, not measured.
 | The author's 11-core machine | **Not run**; k6 was never installed there |
 | TTFT from the SSE body (`xk6-sse`) | **Not possible** with a stock k6 binary; the table uses time to first byte |
 
-### Before you rerun it: two defects in `bench/`
+### Two defects the run found in `bench/`, both since fixed
 
-1. **`bench/lib/common.js` is not in the repository.** All four workloads import
-   it, and the root `.gitignore` carries the Python template's `lib/` rule,
-   which also matches `bench/lib/`. On a fresh clone every workload fails to
-   load. The numbers above were produced with a **reconstructed** `common.js`
-   that implements exactly the names the scripts import, with the behaviour
-   their headers and `bench/README.md` describe: a `constant-vus` or
-   `constant-arrival-rate` scenario per `BENCH_MODE`, ~64-word prompts, a
-   `vortex_cache_hit` rate tagged by tier, a `vortex_ttft_ms` trend, and one
-   `<BENCH_OUT>/<label>.json` summary per arm. Commit the original with
-   `!bench/lib/` added to `.gitignore`, and rerun before trusting these numbers
-   against it.
-2. **`provider-failure.js` sets `responseCallback` in `options`.** k6 ignores
-   it, so the "expected 502/503/504" intent never takes effect; see ¹ above. Set
-   it with `http.setResponseCallback(http.expectedStatuses({ min: 200, max: 299 }, 502, 503, 504))`
-   in the init context instead.
+1. **`bench/lib/common.js` was not in the repository.** All four workloads
+   import it, and the root `.gitignore` carried the Python template's `lib/`
+   rule, which also matched `bench/lib/`, so on a fresh clone every workload
+   failed to load. The numbers above were produced with a **reconstructed**
+   `common.js` that implements the names the scripts import, with the behaviour
+   their headers and `bench/README.md` describe. The original is now committed
+   (`.gitignore` has `!bench/lib/`). It exports everything the scripts import,
+   but it is not the file that produced these numbers, so treat the table as
+   provisional until the matrix is rerun against it.
+2. **`provider-failure.js` set `responseCallback` in `options`.** k6 ignores it
+   there, so the "expected 502/503/504" intent never took effect; see ¹ above.
+   It is now set with `http.setResponseCallback(...)` in the init context, so a
+   rerun reports `http_req_failed` as the share of *unexpected* answers.
 
 `report.py` is not covered by any test in `tests/`, whatever the Day 13 note
 says. It did parse all 24 k6 v2.3.0 summaries from these runs correctly.
@@ -791,3 +913,103 @@ matrix-vector product over the live rows. On caller-supplied traffic both memory
 and lookup cost grow without bound — the same shape of problem ADR-027 caps for
 metric labels, in a tier that is off by default (ADR-005) and would need this
 answered before it is turned on.
+
+## Configuration reference
+
+Every setting is an environment variable prefixed `VORTEX_`, read by
+`vortex_ai_gateway.config.Settings`; `.env` is read too, at lower priority, and
+[`.env.example`](.env.example) carries the long-form notes. Every one has a
+default, so none is required. Lists are comma-separated strings rather than
+JSON, because JSON is a hostile format to type into a deployment console.
+
+**Core**
+
+| Variable | Default | What it does |
+|---|---|---|
+| `VORTEX_ENVIRONMENT` | `local` | `local`, `dev`, `staging` or `prod`; a label on logs and `vortex_build_info` |
+| `VORTEX_LOG_LEVEL` | `INFO` | Python logging level name |
+| `VORTEX_REDIS_URL` | `redis://localhost:6379/0` | shared by the limiter, the ledger and both caches; only dialled when one is on |
+| `VORTEX_REQUEST_TIMEOUT_SECONDS` | `30` | budget for a provider's *answer* |
+| `VORTEX_CONNECT_TIMEOUT_SECONDS` | `5` | budget for the connection itself; separate so an unreachable host cannot hold a worker for 30 s |
+
+**Client keys** ([API keys](#api-keys), ADR-003)
+
+| Variable | Default | What it does |
+|---|---|---|
+| `VORTEX_API_KEYS` | *(empty)* | plaintext allow-list; empty accepts any well-formed bearer token |
+| `VORTEX_KEY_DB_PATH` | *(empty)* | SQLite key store minted by `vortex-keys`; when set, the only source of keys and `VORTEX_API_KEYS` is ignored |
+
+**Routing and providers** ([Provider routing](#provider-routing), ADR-016, ADR-017)
+
+| Variable | Default | What it does |
+|---|---|---|
+| `VORTEX_MODEL_ROUTES` | *(empty)* | ordered `pattern=provider` globs, first match wins; empty serves the mock |
+| `VORTEX_DEFAULT_PROVIDER` | *(empty)* | where an unmatched model goes; empty rejects it |
+| `VORTEX_OPENAI_API_KEY`, `VORTEX_OPENAI_BASE_URL` | *(empty)* | credentials and optional endpoint override |
+| `VORTEX_ANTHROPIC_API_KEY`, `VORTEX_ANTHROPIC_BASE_URL` | *(empty)* | same, for Anthropic |
+| `VORTEX_OLLAMA_API_KEY`, `VORTEX_OLLAMA_BASE_URL` | *(empty)* | same, for Ollama; empty URL is Ollama's own default |
+
+**Resilience** ([Resilience](#resilience), ADR-001, ADR-002, ADR-020)
+
+| Variable | Default | What it does |
+|---|---|---|
+| `VORTEX_RETRY_MAX_ATTEMPTS` | `3` | attempts per request, per provider |
+| `VORTEX_RETRY_BACKOFF_SECONDS` | `0.5` | base of the full-jitter backoff |
+| `VORTEX_RETRY_MAX_BACKOFF_SECONDS` | `10` | cap on one backoff |
+| `VORTEX_RETRY_DEADLINE_SECONDS` | `90` | wall clock for a request and all its retries; must exceed the request timeout |
+| `VORTEX_RETRY_BUDGET_CAPACITY` | `0` | token-bucket cap on retries in aggregate; `0` disables it |
+| `VORTEX_RETRY_BUDGET_REFILL_PER_SECOND` | `0` | that bucket's refill rate |
+| `VORTEX_BREAKER_FAILURE_THRESHOLD` | `5` | failed *requests* (not attempts) that open a provider's breaker |
+| `VORTEX_BREAKER_RESET_SECONDS` | `60` | first open window |
+| `VORTEX_BREAKER_BACKOFF_MULTIPLIER` | `2` | growth of the window on each reopen |
+| `VORTEX_BREAKER_MAX_OPEN_SECONDS` | `600` | ceiling on that window |
+| `VORTEX_FALLBACK_CHAINS` | *(empty)* | `primary>next>last`, comma-separated; tried when the primary is open or out of retries |
+
+**Rate limits and usage** ([Rate limits and usage](#rate-limits-and-usage), ADR-021, ADR-022)
+
+| Variable | Default | What it does |
+|---|---|---|
+| `VORTEX_METERING_ENABLED` | `false` | turns on the limiter and the ledger together; needs Redis, fails open |
+| `VORTEX_RATE_LIMIT_DEFAULT_RPM` | `0` | requests per minute for keys without their own; `0` is unlimited |
+| `VORTEX_RATE_LIMIT_DEFAULT_TPM` | `0` | tokens per minute, likewise |
+| `VORTEX_RATE_LIMIT_ASSUMED_COMPLETION_TOKENS` | `512` | reserved on admission when the caller sets no max, reconciled on settlement |
+| `VORTEX_PRICE_TABLE_PATH` | *(empty)* | JSON overriding built-in prices, USD per million tokens |
+| `VORTEX_USAGE_RETENTION_DAYS` | `30` | how long daily counters live, so how far back `/v1/usage` sees |
+
+**Caching** ([Response cache](#response-cache), ADR-004, ADR-005, ADR-024, ADR-025)
+
+| Variable | Default | What it does |
+|---|---|---|
+| `VORTEX_CACHE_ENABLED` | `false` | exact response cache in Redis |
+| `VORTEX_CACHE_TTL_SECONDS` | `300` | default entry lifetime |
+| `VORTEX_CACHE_TTLS` | *(empty)* | per-route `path=seconds` overrides; `0` means never cache that route |
+| `VORTEX_CACHE_SCOPE` | `key` | `key` namespaces per API key; `global` shares across tenants |
+| `VORTEX_SEMANTIC_CACHE_ENABLED` | `false` | semantic tier behind the exact one; off because no safe threshold has been found |
+| `VORTEX_SEMANTIC_CACHE_THRESHOLD` | `0.95` | cosine similarity required for a semantic hit |
+| `VORTEX_EMBEDDING_MODEL` | *(empty)* | Ollama embedding model; empty means no embedder, so no semantic tier |
+| `VORTEX_EMBEDDING_BASE_URL` | *(empty)* | falls back to `VORTEX_OLLAMA_BASE_URL`, then Ollama's default |
+
+**Observability** ([Observability](#observability), ADR-026 to ADR-029)
+
+| Variable | Default | What it does |
+|---|---|---|
+| `VORTEX_SERVICE_NAME` | `vortex-ai-gateway` | name in traces and `vortex_build_info` |
+| `VORTEX_TRACING_ENABLED` | `false` | OpenTelemetry SDK; off costs one `is None` test per span |
+| `VORTEX_TRACING_EXPORTER` | `otlp` | `otlp` (HTTP) or `console` |
+| `VORTEX_TRACING_ENDPOINT` | *(empty)* | collector URL; empty defers to `OTEL_EXPORTER_OTLP_*` |
+| `VORTEX_TRACING_SAMPLE_RATIO` | `1.0` | share of root traces kept; a sampled parent is always honoured |
+| `VORTEX_METRICS_ENABLED` | `true` | serve the Prometheus endpoint (unauthenticated, ADR-028) |
+| `VORTEX_METRICS_PATH` | `/metrics` | where it is served |
+| `VORTEX_METRICS_LABEL_BUDGET` | `50` | distinct `model` label values before the rest report as `other` |
+
+## About the Name
+
+**Vortex** — A vortex represents a center of concentrated activity and convergence. In fluid dynamics, a vortex is where multiple flows merge into a cohesive center. We chose this name because a gateway should act as a convergence point—drawing together multiple AI requests, models, and services, then directing them intelligently through a unified system.
+
+**AI Gateway** — Self-explanatory. A gateway in networking and systems design controls and directs traffic between different domains. An AI Gateway specifically manages traffic and interactions with artificial intelligence systems.
+
+Together, **vortex-ai-gateway** evokes both the convergence point metaphor and the explicit purpose of the system.
+
+## License
+
+Licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.

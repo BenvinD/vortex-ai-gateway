@@ -27,3 +27,6 @@ deploy
 compose.yaml
 CLAUDE.md
 AGENTS.md
+bench
+Makefile
+CHANGELOG.md
