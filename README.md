@@ -140,6 +140,7 @@ uv run pre-commit run --all-files
 src/vortex_ai_gateway/    # the package (src/ layout, not flat)
 tests/                    # imports the installed package, never src/
 scripts/                  # one-off experiments and load generators
+bench/                    # k6 workloads, the matrix runner, the report (see Benchmarks)
 docs/design|adr|notes/    # the paper trail: before, decided, after
 deploy/                   # Prometheus config, Grafana provisioning, the dashboard JSON
 compose.yaml, Dockerfile  # the reference stack (see Observability)
@@ -409,9 +410,11 @@ sent, so a scanner guessing URLs allocates one series and not one per guess.
 
 ### Tracing
 
-Off by default, and off costs nothing rather than little: with no SDK provider
-installed the OpenTelemetry API returns a no-op tracer, so the instrumentation
-at the seams stays in the code path and does nothing.
+Off by default, and off costs one `is None` test per span. That is something
+`span()` does on purpose, not a property of OpenTelemetry. A no-op *tracer*
+still builds generator context managers on every span, which measured at 16% of
+a request until `span()` learned to return one shared inert context manager
+when no provider is installed (ADR-029, and [Benchmarks](#benchmarks)).
 
 ```bash
 VORTEX_TRACING_ENABLED=true VORTEX_TRACING_EXPORTER=console \
@@ -512,26 +515,36 @@ carry the most:
 | Breaker state | `vortex_breaker_state`, mapped 0 → closed, 1 → half-open, 2 → **OPEN** |
 | Spend / hour | `sum(rate(vortex_cost_usd_total[...])) * 3600` |
 
-> **No screenshot yet.** Docker is not installed on the machine this was built
-> on, so the stack has never been stood up end to end. What *is* verified runs
-> in CI: every `vortex_*` metric the eighteen panels query exists on a live
-> gateway, and the datasource UID they reference is the one `deploy/` pins —
-> which is the failure that would otherwise be found by a person reading "No
-> data" on one panel out of eighteen. What is **not** verified is everything
-> that needs a container to run: the `Dockerfile` has never been built, and
-> Prometheus has never scraped anything. The gateway numbers above are real and
-> were measured natively against Redis and uvicorn. On a machine with Docker:
+> **Verified end to end, on 2026-09-22, in a cloud sandbox.** `docker compose
+> --profile tracing up` with `VORTEX_TRACING_ENABLED=true` brought up all five
+> services; the gateway and Redis report healthy. Prometheus scrapes the
+> gateway every 5 s with no errors; Grafana provisions the datasource (UID
+> `vortex-prometheus`) and this dashboard. After `scripts/generate_traffic.py`,
+> all 18 panels (22 queries) return data. Five of them (error rate, upstream
+> calls per request, retries and give-ups, fallback hops, breaker state) stay
+> empty on the default stack, because the mock is not wrapped in a
+> `ResilientProvider` and nothing returns a 5xx. Routing a model at a dead
+> upstream with a fallback chain filled all five. Jaeger received one trace per
+> request, with the cache-tier, provider and per-attempt spans nested as in
+> [Tracing](#tracing), and each log line's `trace_id` matched its trace.
 >
-> ```bash
-> docker compose up -d
-> uv run python scripts/generate_traffic.py --requests 2000 --delay 0.05
-> open http://localhost:3000   # screenshot it, and replace this note
-> ```
+> Two things about the sandbox, so nobody mistakes that run for a clean one.
+> Docker Hub was rate-limited and ghcr.io and the Debian mirrors were blocked,
+> so the images came from `mirror.gcr.io`, and the gateway image was built from
+> a copy of the `Dockerfile` with two changes: a local stand-in for the
+> `ghcr.io/astral-sh/uv` base (same Python and Debian, uv from PyPI), and the
+> `curl` install swapped for a Python one-liner health check. The committed
+> `Dockerfile` itself has still not been built unmodified. Its
+> `uv sync --locked --no-editable` step did run and passed.
 >
-> For a screenshot *under load* rather than under a trickle — which is the one
-> worth having, since the latency and TTFT panels are flat lines at this
-> volume — point the benchmark suite at the compose stack instead, and grab the
-> dashboard while the run is in flight:
+> Three things that read like bugs on the dashboard and are not: **Error rate**
+> counts only 5xx, so 429s and 4xx never move it; **Breakers open** shows the
+> last value in the range, so it can report a breaker that a restart has
+> already removed; and with no routing table the mock answers any model name,
+> so an "unroutable" request from the traffic generator is a 200.
+>
+> Still to do: commit a screenshot. For one *under load*, point k6 at the
+> stack and grab the dashboard while the run is in flight:
 >
 > ```bash
 > BENCH_URL=http://localhost:8000 BENCH_DURATION=5m BENCH_VUS=64 \
@@ -563,26 +576,137 @@ bench/run-matrix.sh
 uv run bench/report.py bench/results/<timestamp>
 ```
 
+### Results
+
+Median of **three full runs** of the matrix, each cell `[min–max]` across the
+three. Closed loop, 32 VUs, 30 s measured window per arm, Redis flushed and the
+gateway restarted between arms, all 48 `VORTEX_*` settings pinned by
+`run-matrix.sh`. Gateway at `6a8de6c`, clean tree.
+
 | Workload | Workers | Semantic | p50 | p95 | p99 | RPS | Errors |
 |---|---|---|---|---|---|---|---|
-| baseline | 1 | off | — | — | — | — | — |
-| baseline | 4 | off | — | — | — | — | — |
-| cache-hit | 1 | off | — | — | — | — | — |
-| cache-hit | 4 | off | — | — | — | — | — |
-| streaming | 1 | off | — | — | — | — | — |
-| streaming | 4 | off | — | — | — | — | — |
-| provider-failure | 1 | off | — | — | — | — | — |
-| provider-failure | 4 | off | — | — | — | — | — |
-| baseline | 1 | on | — | — | — | — | — |
-| cache-hit | 1 | on | — | — | — | — | — |
+| baseline | 1 | off | 66.8 ms [65.9–68.1] | 86.7 ms [84.0–87.1] | 169.3 ms [165.1–173.3] | 450 [443–459] | 0.00% |
+| baseline | 4 | off | 55.5 ms [55.2–56.1] | 67.8 ms [67.2–68.1] | 74.7 ms [72.1–75.1] | 578 [557–578] | 0.00% |
+| cache-hit | 1 | off | 57.6 ms [56.9–58.0] | 72.1 ms [70.7–73.9] | 118.0 ms [116.7–123.6] | 530 [528–534] | 0.00% |
+| cache-hit | 4 | off | 52.0 ms [51.8–54.5] | 63.9 ms [63.6–67.5] | 68.5 ms [68.3–72.2] | 545 [532–551] | 0.00% |
+| streaming | 1 | off | 175.5 ms [173.0–175.7] | 212.3 ms [207.5–212.5] | 274.6 ms [257.5–283.5] | 177 [177–179] | 0.00% |
+| streaming | 4 | off | 54.4 ms [47.7–54.5] | 75.8 ms [55.8–76.9] | 93.1 ms [64.6–95.9] | 557 [553–659] | 0.00% |
+| provider-failure | 1 | off | 11.0 ms [10.2–11.3] | 35.7 s [35.6–35.7] | 38.8 s [38.8–38.9] | 19 [19–20] | 31.43%¹ |
+| provider-failure | 4 | off | 3.6 ms [3.5–3.9] | 22.0 s [18.2–25.4] | 26.8 s [22.4–29.7] | 53 [47–57] | 64.75%¹ |
+| baseline | 1 | on | *not run²* | | | | |
+| cache-hit | 1 | on | *not run²* | | | | |
 
-> **The matrix has not been run.** k6 is not installed on the machine this was
-> built on, so every cell above is empty, and it is empty rather than estimated.
-> The scripts are written, they parse, and `report.py` is tested against a
-> fixture of the summary shape k6 emits — but a table of plausible numbers for a
-> load test nobody ran would be the most convincing untrue thing in this
-> repository, which is the same rule the dashboard note below follows. One
-> command fills it in, and the row order above is the order `report.py` prints.
+¹ Not an error rate. `provider-failure.js` puts `responseCallback` inside
+`options`, which k6 does not recognise (it warns `unknown field
+"responseCallback"` and ignores it), so every expected 502/503/504 from the
+storm is counted as a failed request. The column is the storm's share of all
+requests. Every check passed and no threshold failed, in any arm, in any run.
+
+² No embedder was reachable, so `run-matrix.sh` skipped both semantic arms, as
+it is written to. They are configured, not measured.
+
+**What else the runs recorded** (medians of three):
+
+| Arm | |
+|---|---|
+| cache-hit, 1 and 4 workers | exact-tier hit rate 100% over the measured window |
+| streaming, 1 worker | client-side TTFT p50 91.7 ms, p99 185.8 ms |
+| streaming, 4 workers | client-side TTFT p50 10.2 ms, p99 42.9 ms |
+| provider-failure, 1 worker | **bystander p50 2.4 ms, p95 118.8 ms, p99 191.1 ms**; give-ups (504) median 35.5 s; breaker refusals (503) median 30.9 s; 1,101 iterations dropped by k6 |
+| provider-failure, 4 workers | **bystander p50 2.1 ms, p95 6.0 ms, p99 13.1 ms**; give-ups median 20.8 s; refusals median 3.9 ms; 396 iterations dropped |
+
+### Measured on
+
+| | |
+|---|---|
+| Host | Linux 6.18 x86_64 cloud sandbox, **4 vCPU**, 15 GB RAM, shared by k6, Redis and the gateway |
+| Load generator | k6 v2.3.0 (binary taken from the official `grafana/k6` image) |
+| Gateway | Python 3.14.7, uvicorn, `--no-access-log --log-level warning`, `VORTEX_LOG_LEVEL=INFO` |
+| Redis | 7.0.15, native, `--save "" --appendonly no`, port 6399 |
+| Provider | the built-in mock for every workload except provider-failure, which routes `broken-*` at `http://10.255.255.1:1` (blackholed: a connect there times out, it is not refused) |
+| Network | loopback; the sandbox's outbound proxy variables unset for the run, so the gateway's httpx client connected directly, as it would on a laptop |
+
+### How to read it
+
+* **In a closed loop, latency here is mostly queue.** 32 VUs against one
+  saturated worker gives p50 ≈ 32 / RPS (baseline: 32 / 450 = 71 ms, measured
+  66.8 ms). The latency columns say how long a request waited at this
+  concurrency, not what one request costs on an idle gateway. For that cost,
+  see the in-process numbers below.
+* **The 4-worker rows measure the box, not the gateway's scaling.** baseline,
+  cache-hit and streaming all top out at 545–578 req/s with four workers, which
+  is where four gateway processes, k6 and Redis run out of four vCPUs. The
+  1 → 4 ratios `report.py` prints (baseline 1.28×, cache-hit 1.03×, streaming
+  3.15×) are floors, as `bench/README.md` warns. Streaming scales best because
+  one worker is CPU-bound on it (177 req/s against 450 buffered).
+* **A cache hit saves little here, and that is expected.** The mock provider
+  answers in no time, so a hit buys only 18% more throughput than a miss (530 vs 450 req/s
+  at one worker). What the tier saves in production is a vendor round trip,
+  which this suite deliberately excludes.
+* **The bystander assertion holds.** At 1 worker it degrades: p95 is 50× its
+  median while the storm holds the only event loop. It stays inside the script's
+  `p(95)<250 ms` and `p(99)<1000 ms`, and with four workers it hardly moves.
+  One dead vendor does not take the gateway down.
+* **But the breaker does not make a 503 free under concurrent load.** At one
+  worker the median 503 took **30.9 s**, and the gateway recorded 800 upstream
+  attempts for 100 give-ups. Retries against the dead upstream are checked with
+  the breaker *before each attempt*, but a failure is recorded *once per
+  request*, after its retries are spent. With `breaker_failure_threshold=5`,
+  five requests each have to burn about 3 × 5 s of connect timeouts before the
+  breaker opens. At 50 req/s offered, hundreds of requests are mid-retry by
+  then, and each is cut off with a 503 after about 2.9 attempts. The cheap
+  refusal ADR-002 describes exists (median 3.9 ms at four workers), but only
+  after that transient, and a 30 s window is mostly transient. This is a finding
+  about the gateway, not the harness.
+* **The storm was not delivered at the offered rate.** k6 hit the scenario's
+  408-VU cap and dropped 1,101 iterations at one worker (396 at four). Per
+  `bench/README.md`'s own rule, the provider-failure latencies are reported with
+  that caveat: the open loop did not keep up.
+* **The cross-check only works at one worker.** At one worker the client and
+  the gateway agree on the request count to within two health probes. At four,
+  `report.py` flags every arm "← investigate", because a `/metrics` scrape
+  reaches one worker out of four. Summing label sets does not help, since the
+  missing samples belong to other processes. The TTFT pair disagrees at one
+  worker too (client 85 ms vs gateway 49 ms, run 1): under saturation the
+  client's time to first byte includes queueing the gateway's middleware never
+  sees, so "should agree to within the loopback round trip" holds only below
+  saturation.
+
+### Ran, and what did not
+
+| Item | Status |
+|---|---|
+| `bench/run-matrix.sh`, semantic off, 1 and 4 workers, all four workloads | **Run**, three times; the table above |
+| In-process before/after of ADR-029 | **Run**; see below |
+| `docker compose` stack: build, scrape, provisioning, 18 panels, Jaeger traces | **Run**; see [The dashboard](#the-dashboard) |
+| Semantic arms (`BENCH_SEMANTIC_ARMS=on`) | **Configured, not run**: no Ollama with `nomic-embed-text` was reachable |
+| Open-loop mode (`BENCH_MODE=rate`) for baseline, cache-hit, streaming | **Configured, not run** |
+| `BENCH_DEAD_UPSTREAM=http://127.0.0.1:9` (connection refused) | **Configured, not run** |
+| k6 against the compose stack while screenshotting the dashboard | **Configured, not run** |
+| Any real vendor | **Not run**; every number above is gateway-only by design |
+| The author's 11-core machine | **Not run**; k6 was never installed there |
+| TTFT from the SSE body (`xk6-sse`) | **Not possible** with a stock k6 binary; the table uses time to first byte |
+
+### Before you rerun it: two defects in `bench/`
+
+1. **`bench/lib/common.js` is not in the repository.** All four workloads import
+   it, and the root `.gitignore` carries the Python template's `lib/` rule,
+   which also matches `bench/lib/`. On a fresh clone every workload fails to
+   load. The numbers above were produced with a **reconstructed** `common.js`
+   that implements exactly the names the scripts import, with the behaviour
+   their headers and `bench/README.md` describe: a `constant-vus` or
+   `constant-arrival-rate` scenario per `BENCH_MODE`, ~64-word prompts, a
+   `vortex_cache_hit` rate tagged by tier, a `vortex_ttft_ms` trend, and one
+   `<BENCH_OUT>/<label>.json` summary per arm. Commit the original with
+   `!bench/lib/` added to `.gitignore`, and rerun before trusting these numbers
+   against it.
+2. **`provider-failure.js` sets `responseCallback` in `options`.** k6 ignores
+   it, so the "expected 502/503/504" intent never takes effect; see ¹ above. Set
+   it with `http.setResponseCallback(http.expectedStatuses({ min: 200, max: 299 }, 502, 503, 504))`
+   in the init context instead.
+
+`report.py` is not covered by any test in `tests/`, whatever the Day 13 note
+says. It did parse all 24 k6 v2.3.0 summaries from these runs correctly.
 
 ### What *has* been measured, and how
 
@@ -596,6 +720,23 @@ second worker, or an error rate. Configuration: buffered `POST
 tracing off, no Redis, `log_level=INFO` so the access-log line is written.
 Reported as the minimum of nine runs of 8,000 requests, after a 300-request
 warmup.
+
+The harness that produced the numbers below is not committed. An equivalent
+one, written from the description above, was run against `git archive` exports
+of `ef91752` (before) and `6a8de6c` (after), each installed non-editable, on
+the 4-vCPU sandbox. It alternated before/after/before/after:
+
+| | min µs / request | p50 µs / request |
+|---|---|---|
+| before, run 1 | 625.4 | 630.2 |
+| after, run 1 | 523.8 | 527.9 |
+| before, run 2 | 584.7 | 602.0 |
+| after, run 2 | 497.1 | 512.2 |
+| | **−16.2%, −15.0%** | |
+
+The direction and the size reproduce (−15 to −16% against −17.3% below). The
+absolute figures do not: that CPU is about 4× slower per request than the one
+below, so compare the ratios and not the microseconds.
 
 ### The bottleneck: instrumentation that was not free switched off
 
