@@ -80,10 +80,11 @@ both on.
 ### Local + semantic cache
 
 The newest tier (ADR-024, ADR-025), and the one worth showing. It needs Redis
-and an embedder:
+and an embedder — this host already runs `redis-server` as a systemd service
+and already has `nomic-embed-text` pulled, so there is nothing to start:
 
 ```bash
-docker compose up -d redis
+redis-cli ping        # -> PONG, already running
 
 VORTEX_MODEL_ROUTES= \
 VORTEX_METERING_ENABLED=true VORTEX_CACHE_ENABLED=true \
@@ -97,6 +98,11 @@ VORTEX_RATE_LIMIT_DEFAULT_RPM=600 VORTEX_RATE_LIMIT_DEFAULT_TPM=150000 \
 `nomic-embed-text` is one of the two embedding models already pulled in the
 local Ollama. There is deliberately no default model — a threshold measured for
 one model is only a prior for the next.
+
+Do **not** run `docker compose up -d redis` for this: the host's `redis-server`
+already holds 6379, so the container cannot bind it. See
+`compose.override.yaml` at the project root for how that is handled for
+`make demo`.
 
 ## Run it from the command line
 

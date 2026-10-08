@@ -56,3 +56,8 @@ htmlcov/
 # committed on purpose (ADR-023) — they are repo policy. Personal overrides
 # and machine-local state are not.
 .claude/settings.local.json
+
+# Machine-local compose overrides (host port clashes, local vendor keys).
+# compose.yaml is the committed stack; this file is one laptop.
+compose.override.yaml
+compose.override.yml
