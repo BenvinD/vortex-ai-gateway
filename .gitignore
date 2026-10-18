@@ -31,6 +31,8 @@ env/
 # IDE
 .vscode/
 .idea/
+# PyCharm run configurations stored outside .idea/ ("Store as project file").
+.run/
 *.swp
 *.swo
 *~
@@ -61,3 +63,8 @@ htmlcov/
 # compose.yaml is the committed stack; this file is one laptop.
 compose.override.yaml
 compose.override.yml
+
+# Local debugging rig: the stub upstream, the .http request walk and the
+# breakpoint map used to step through the gateway. Personal study material,
+# not part of the project.
+debug/
