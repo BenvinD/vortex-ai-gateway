@@ -31,6 +31,8 @@ env/
 # IDE
 .vscode/
 .idea/
+# PyCharm run configurations stored outside .idea/ ("Store as project file").
+.run/
 *.swp
 *.swo
 *~
@@ -56,3 +58,8 @@ htmlcov/
 # committed on purpose (ADR-023) — they are repo policy. Personal overrides
 # and machine-local state are not.
 .claude/settings.local.json
+
+# Local debugging rig: the stub upstream, the .http request walk and the
+# breakpoint map used to step through the gateway. Personal study material,
+# not part of the project.
+debug/
