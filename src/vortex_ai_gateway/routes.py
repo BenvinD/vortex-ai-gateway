@@ -54,6 +54,7 @@ from starlette.responses import Response
 from vortex_ai_gateway.auth import Principal, require_api_key
 from vortex_ai_gateway.cache import ResponseCache
 from vortex_ai_gateway.contracts import (
+    ChatCompletionChunk,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ErrorDetail,
@@ -259,8 +260,18 @@ def create_chat_router(
             )
 
         if request.stream:
+            try:
+                # Asked for here, before the `200` is committed, and never
+                # inside the body generator: the router raises an unroutable
+                # model from `stream()` itself so it can still be a `404`, and
+                # the body only runs once the status line is on the wire
+                # (ADR-032). The gateway asks for usage on every stream; only
+                # the forwarding is conditional. See `streaming.metered`.
+                stream = provider.stream(metered(request))
+            except Exception as exc:
+                return await _failed(exc, provider, request, meter, reservation, headers)
             return StreamingResponse(
-                _stream_events(provider, request, meter, reservation),
+                _stream_events(provider, request, stream, meter, reservation),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-store",
@@ -276,17 +287,7 @@ def create_chat_router(
             ):
                 completion = await provider.complete(request)
         except Exception as exc:
-            logger.exception("provider request failed", provider=provider.name, model=request.model)
-            await meter.discard(reservation)
-            http_status, envelope = _failure(exc)
-            retry_after = getattr(exc, "retry_after", None)
-            if retry_after:
-                headers["Retry-After"] = str(int(retry_after))
-            return JSONResponse(
-                status_code=http_status,
-                content=envelope.model_dump(mode="json"),
-                headers=headers or None,
-            )
+            return await _failed(exc, provider, request, meter, reservation, headers)
 
         _served_by(http_request, completion)
         await meter.settle(reservation, completion.usage)
@@ -322,6 +323,35 @@ def create_chat_router(
         return await meter.ledger.report(principal.key_id, days=days)
 
     return router
+
+
+async def _failed(
+    exc: Exception,
+    provider: ChatProvider,
+    request: ChatCompletionRequest,
+    meter: Meter,
+    reservation: Reservation,
+    headers: dict[str, str],
+) -> JSONResponse:
+    """The response for a request that failed before anything was sent.
+
+    One path for both shapes of request, because before the status line a
+    stream is no different from a buffered call: the failure can still be a
+    status code, and the reservation comes back in full, since nothing was
+    generated. Called from inside the ``except`` that caught ``exc``, so the log
+    line carries its traceback.
+    """
+    logger.exception("provider request failed", provider=provider.name, model=request.model)
+    await meter.discard(reservation)
+    http_status, envelope = _failure(exc)
+    retry_after = getattr(exc, "retry_after", None)
+    if retry_after:
+        headers["Retry-After"] = str(int(retry_after))
+    return JSONResponse(
+        status_code=http_status,
+        content=envelope.model_dump(mode="json"),
+        headers=headers or None,
+    )
 
 
 def _mark(current: Span, outcome: str | None, score: float | None = None) -> None:
@@ -360,10 +390,14 @@ def _today() -> str:
 async def _stream_events(
     provider: ChatProvider,
     request: ChatCompletionRequest,
+    stream: AsyncIterator[ChatCompletionChunk],
     meter: Meter,
     reservation: Reservation,
 ) -> AsyncIterator[str]:
     """Yield the SSE body for a streaming completion.
+
+    ``stream`` was asked for by the route, before the ``200`` (ADR-032); by
+    the time this runs, the only way left to report a failure is an event.
 
     Three ways this ends, and all three have to leave the same trail — a
     :class:`~vortex_ai_gateway.streaming.StreamRecord` naming what the request
@@ -386,9 +420,6 @@ async def _stream_events(
     """
     record = StreamRecord(provider=provider.name, model=request.model)
     forward_usage = wants_usage(request)
-    # The gateway asks for usage on every stream; only the forwarding is
-    # conditional. See `streaming.metered`.
-    stream = provider.stream(metered(request))
     try:
         try:
             async for chunk in stream:

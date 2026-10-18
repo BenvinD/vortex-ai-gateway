@@ -18,6 +18,7 @@ import pytest
 import yaml
 from fakeredis import aioredis
 from fastapi import FastAPI
+from structlog.testing import capture_logs
 
 from tests.test_cache import body, client_for
 from tests.test_resilience import ScriptedProvider, resilient
@@ -41,9 +42,12 @@ from vortex_ai_gateway.providers.resilience_wrapper import (
     GAVE_UP_BUDGET,
     GAVE_UP_DEADLINE,
     GAVE_UP_EXHAUSTED,
+    GAVE_UP_TRIAL,
+    GIVE_UP_EVENT,
     FallbackProvider,
+    ResilientProvider,
 )
-from vortex_ai_gateway.resilience import CircuitBreaker, RetryBudget
+from vortex_ai_gateway.resilience import CircuitBreaker, RetryBudget, RetryPolicy
 
 CHAT_URL = "/v1/chat/completions"
 
@@ -398,16 +402,52 @@ async def test_a_non_retryable_failure_is_one_attempt_and_no_retries() -> None:
     ],
     ids=["attempts", "budget", "deadline"],
 )
-async def test_the_three_ways_to_give_up_stay_distinguishable(
+async def test_each_way_to_give_up_is_counted_once_under_its_own_reason(
     sleeps: list[float], reason: str, overrides: dict[str, object]
 ) -> None:
-    """Each means something different is wrong; one counter would hide which."""
+    """Each means something different is wrong; one counter would hide which.
+
+    And each is *one* give-up. A budget or deadline give-up used to be counted
+    under its own reason and again as "attempts exhausted", and logged twice —
+    the second line claiming every attempt was made. Asserting only that the
+    right reason read 1 never noticed the wrong one reading 1 as well.
+    """
     inner = ScriptedProvider(ProviderUnavailable("down", provider="primary"))
 
-    with pytest.raises(ProviderUnavailable):
+    with capture_logs() as logs, pytest.raises(ProviderUnavailable):
         await resilient(inner, **overrides).complete(chat_request())
 
-    assert value("vortex_provider_give_ups_total", provider="primary", reason=reason) == 1.0
+    every_reason = (GAVE_UP_EXHAUSTED, GAVE_UP_BUDGET, GAVE_UP_DEADLINE, GAVE_UP_TRIAL)
+    counts = {
+        r: value("vortex_provider_give_ups_total", provider="primary", reason=r)
+        for r in every_reason
+    }
+    assert counts == {**dict.fromkeys(every_reason, 0.0), reason: 1.0}
+    give_ups = [entry for entry in logs if entry["event"] == GIVE_UP_EVENT]
+    assert len(give_ups) == 1, "one give-up, one line"
+    assert give_ups[0]["reason"] == reason
+    assert give_ups[0]["attempts"] == inner.calls, "the attempts actually made"
+
+
+async def test_a_failed_trial_gives_up_under_a_reason_of_its_own(sleeps: list[float]) -> None:
+    """One call by design is not a sequence that ran out of attempts (ADR-030)."""
+    inner = ScriptedProvider(ProviderUnavailable("still down", provider="primary"))
+    # A zero-length window: the next caller after the failure is the trial.
+    breaker = CircuitBreaker(name="primary", failure_threshold=1, open_seconds=0.0)
+    wrapper = ResilientProvider(inner=inner, policy=RetryPolicy(max_attempts=3), breaker=breaker)
+    await breaker.record_failure()
+
+    with pytest.raises(ProviderUnavailable):
+        await wrapper.complete(chat_request())
+
+    assert value("vortex_provider_give_ups_total", provider="primary", reason=GAVE_UP_TRIAL) == 1.0
+    assert (
+        value("vortex_provider_give_ups_total", provider="primary", reason=GAVE_UP_EXHAUSTED) == 0.0
+    )
+    assert (
+        value("vortex_provider_retries_total", provider="primary", error="ProviderUnavailable")
+        == 0.0
+    )
 
 
 async def test_a_fallback_hop_is_counted_from_and_to() -> None:

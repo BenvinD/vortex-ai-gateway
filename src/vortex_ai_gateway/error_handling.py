@@ -82,6 +82,25 @@ class RateLimitedError(GatewayError):
         )
 
 
+class RequestTooLargeError(GatewayError):
+    """The request can never fit inside the caller's token allowance (ADR-031).
+
+    Not a :class:`RateLimitedError`, on purpose. A ``429`` says "wait", and
+    carries a ``Retry-After`` saying how long; for a request whose estimate is
+    larger than the whole bucket, no wait is long enough, and every OpenAI SDK
+    retries a ``429`` by itself. A ``400`` says "change the request", which is
+    the only thing that can help — so it carries no ``Retry-After`` at all.
+    """
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(
+            message,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            error_type="invalid_request_error",
+            code=code,
+        )
+
+
 def install_error_handlers(app: FastAPI) -> None:
     """Register the handlers that render every failure as an envelope."""
 

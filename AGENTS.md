@@ -56,7 +56,9 @@ translating that contract to and from its own format. `routing.py` maps model
 names onto providers from config and is itself a `ChatProvider`, so `create_app`
 mounts a router exactly where it would mount one adapter; with no routing table
 configured it falls back to the mock. `routes.py` owns the HTTP surface and the
-only place a provider failure becomes a status code. `streaming.py` owns what a
+only place a provider failure becomes a status code — a stream's too, up to the
+moment the route returns, because it calls `stream()` before the `200` is
+committed (ADR-032). `streaming.py` owns what a
 stream *costs*: it asks every provider for usage regardless of what the caller
 requested, strips the usage chunk back out when the caller did not ask
 (ADR-018), and writes one `stream finished` record per streamed request —
@@ -69,7 +71,9 @@ them through the `ChatProvider` seam: `ResilientProvider` wraps one adapter with
 retries and a breaker of its own, `FallbackProvider` tries an ordered chain.
 `build_router` wraps every adapter before the router sees it, so
 `router.providers` holds wrappers, not adapters — reach the adapter through
-`.inner` (ADR-001, ADR-002, ADR-020).
+`.inner` (ADR-001, ADR-002, ADR-020). The breaker's half-open trial is one
+call, and `allow()` returns a `Permit` so that only the call holding the
+trial slot can hand it back (ADR-030).
 
 `auth.py` answers *who is calling* and returns a `Principal`, never a token:
 `key_id` is public, stable, and safe to put in a Redis key or a log line, which
@@ -86,6 +90,9 @@ has) or `discard` (it produced nothing). The limiter is a per-key RPM/TPM token
 bucket in one Lua script, because a request refused by the token bucket must not
 have already spent a request; the ledger stores integer token counts and prices
 them at read time, so a corrected price corrects the history (ADR-021, ADR-022).
+An estimate larger than the key's whole TPM is a `400`, not a `429`: a bucket
+never holds more than its capacity, so no wait would admit it, and it is
+decided from the key before Redis is asked (ADR-031).
 Both hang off one Redis connection and are absent together, controlled by
 `VORTEX_METERING_ENABLED` — off by default, so a local run needs no Redis. Both
 fail *open*, and Redis is deliberately not a readiness check: draining a working

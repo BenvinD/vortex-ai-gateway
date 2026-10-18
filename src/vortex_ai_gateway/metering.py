@@ -10,7 +10,8 @@ The shape of a metered request:
 
 1. **Admit.** Estimate what it will cost, reserve that against the caller's
    buckets, and either get a decision to attach to the response headers or a
-   ``429`` to raise.
+   ``429`` to raise — or, for a request larger than the whole token allowance,
+   a ``400``, because no amount of waiting would admit it (ADR-031).
 2. **Settle.** However it ended, hand back the difference between what was
    reserved and what was actually spent, and write the real numbers to the
    ledger.
@@ -35,7 +36,7 @@ import structlog
 from vortex_ai_gateway.auth import Principal
 from vortex_ai_gateway.config import Settings
 from vortex_ai_gateway.contracts import ChatCompletionRequest, TokenUsage
-from vortex_ai_gateway.error_handling import RateLimitedError
+from vortex_ai_gateway.error_handling import RateLimitedError, RequestTooLargeError
 from vortex_ai_gateway.metrics import COST, TOKENS, model_label
 from vortex_ai_gateway.pricing import PriceTable
 from vortex_ai_gateway.ratelimit import Decision, RateLimiter, estimate_tokens
@@ -48,6 +49,10 @@ logger = structlog.get_logger(__name__)
 #: "you are sending too much" and the other is "our account is", and whoever is
 #: paged needs to know which.
 GATEWAY_LIMIT_CODE: Final = "gateway_rate_limit_exceeded"
+
+#: What a caller is told when a request's estimate exceeds their whole token
+#: allowance, so it could not be admitted however long they waited (ADR-031).
+TOO_LARGE_CODE: Final = "request_exceeds_token_limit"
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,7 +98,7 @@ class Meter:
         self.prices = prices
 
     async def admit(self, principal: Principal, request: ChatCompletionRequest) -> Reservation:
-        """Reserve this request's estimated cost, or raise the ``429``.
+        """Reserve this request's estimated cost, or raise the ``429`` or ``400``.
 
         The rejection carries both the ``Retry-After`` a client should obey and
         the ``X-RateLimit-*`` headers that say which of the two limits was hit —
@@ -103,6 +108,20 @@ class Meter:
         estimate = estimate_tokens(request, self.settings)
         if self.limiter is None:
             return Reservation(principal, Decision.unlimited(), request.model)
+
+        if principal.metered and 0 < principal.tpm < estimate:
+            # A bucket never holds more than its capacity, so this request could
+            # wait forever and still not fit; the `429` it used to get promised
+            # otherwise (ADR-031). Decided from the key alone, before Redis is
+            # asked: it spends nothing from the request bucket, and the answer
+            # is the same while Redis is down and the limiter is failing open.
+            raise RequestTooLargeError(
+                f"This request is estimated at {estimate} tokens, more than this "
+                f"API key's whole allowance of {principal.tpm} tokens per minute, "
+                "so it can never be admitted. Lower max_completion_tokens, shorten "
+                "the prompt, or ask for a higher token limit.",
+                code=TOO_LARGE_CODE,
+            )
 
         decision = await self.limiter.admit(principal, tokens=estimate)
         if not decision.allowed:

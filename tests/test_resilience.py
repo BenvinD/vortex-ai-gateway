@@ -39,25 +39,26 @@ from vortex_ai_gateway.routing import RoutingConfigError, build_router, parse_fa
 class ScriptedProvider:
     """A provider that replays a script of outcomes and counts its calls.
 
-    An entry that is an exception is raised; anything else is served by a real
-    :class:`MockProvider`, so a "success" is a genuinely well-formed response
-    rather than a sentinel the assertions have to special-case.
+    An entry that is an exception is raised — any ``BaseException``, so a
+    cancellation can be scripted like any other ending; anything else is served
+    by a real :class:`MockProvider`, so a "success" is a genuinely well-formed
+    response rather than a sentinel the assertions have to special-case.
     """
 
-    def __init__(self, *script: Exception | None, name: str = "primary") -> None:
+    def __init__(self, *script: BaseException | None, name: str = "primary") -> None:
         self.name = name
-        self._script: list[Exception | None] = list(script)
+        self._script: list[BaseException | None] = list(script)
         self._inner = MockProvider(name=name)
         self.calls = 0
 
-    def _next(self) -> Exception | None:
+    def _next(self) -> BaseException | None:
         outcome = self._script[min(self.calls, len(self._script) - 1)] if self._script else None
         self.calls += 1
         return outcome
 
     async def complete(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         outcome = self._next()
-        if isinstance(outcome, Exception):
+        if isinstance(outcome, BaseException):
             raise outcome
         return await self._inner.complete(request)
 
@@ -250,16 +251,18 @@ async def test_the_breaker_probes_with_exactly_one_trial(clock: Callable[[float]
     breaker = CircuitBreaker(name="primary", failure_threshold=1, open_seconds=10.0)
     await breaker.record_failure()
     assert await breaker.state() is resilience.BreakerState.OPEN
-    assert await breaker.allow() is False
+    assert await breaker.allow() is None
 
     clock(10.0)
-    assert await breaker.allow() is True, "the first caller takes the trial"
-    assert await breaker.allow() is False, "everyone else still waits"
+    trial = await breaker.allow()
+    assert trial is not None and trial.trial, "the first caller takes the trial"
+    assert await breaker.allow() is None, "everyone else still waits"
     assert await breaker.state() is resilience.BreakerState.HALF_OPEN
 
     await breaker.record_success()
     assert await breaker.state() is resilience.BreakerState.CLOSED
-    assert await breaker.allow() is True
+    admitted = await breaker.allow()
+    assert admitted is not None and not admitted.trial
 
 
 async def test_a_failed_trial_reopens_the_breaker_for_longer(
@@ -301,27 +304,150 @@ async def test_the_open_window_stops_growing_at_the_cap(clock: Callable[[float],
     assert windows == [10.0, 50.0, 50.0, 50.0], "x10 would be 100s; the cap holds it at 50"
 
 
-async def test_a_cancelled_trial_hands_the_slot_back(clock: Callable[[float], None]) -> None:
-    """A client disconnect must not wedge the breaker in half-open forever."""
+@pytest.mark.parametrize(
+    ("ending", "state_after", "next_caller_admitted"),
+    [
+        (None, resilience.BreakerState.CLOSED, True),
+        (
+            ProviderUnavailable("still down", provider="primary"),
+            resilience.BreakerState.OPEN,
+            False,
+        ),
+        (
+            ProviderBadRequest("unknown model", provider="primary"),
+            resilience.BreakerState.HALF_OPEN,
+            True,
+        ),
+        (KeyError("adapter bug"), resilience.BreakerState.HALF_OPEN, True),
+        (asyncio.CancelledError(), resilience.BreakerState.HALF_OPEN, True),
+    ],
+    ids=["answers", "still-down", "callers-400", "adapter-bug", "cancelled"],
+)
+async def test_every_way_a_trial_ends_leaves_the_breaker_able_to_recover(
+    clock: Callable[[float], None],
+    sleeps: list[float],
+    ending: BaseException | None,
+    state_after: resilience.BreakerState,
+    next_caller_admitted: bool,
+) -> None:
+    """A trial slot nobody hands back wedges the breaker in half-open forever (ADR-030).
 
-    class Hangs:
+    Only cancellation used to hand it back. The two that learned something
+    move the breaker; the three that learned nothing free the slot for the
+    next caller and leave the breaker where it was.
+    """
+    inner = ScriptedProvider(ending)
+    breaker = CircuitBreaker(name="primary", failure_threshold=1, open_seconds=10.0)
+    wrapper = ResilientProvider(inner=inner, policy=policy(), breaker=breaker)
+    await breaker.record_failure()
+    clock(10.0)
+
+    if ending is None:
+        await wrapper.complete(chat_request())
+    else:
+        with pytest.raises(type(ending)):
+            await wrapper.complete(chat_request())
+
+    assert inner.calls == 1, "a trial is one call, however it ends"
+    assert await breaker.state() is state_after
+    assert (await breaker.allow() is not None) is next_caller_admitted
+
+
+async def test_a_trial_that_finds_the_provider_still_down_reopens_without_retrying(
+    clock: Callable[[float], None], sleeps: list[float]
+) -> None:
+    """The trial's own retry used to be refused by its own reservation, leaking the slot."""
+    inner = ScriptedProvider(ProviderUnavailable("still down", provider="primary"), None)
+    breaker = CircuitBreaker(name="primary", failure_threshold=1, open_seconds=10.0)
+    wrapper = ResilientProvider(inner=inner, policy=policy(max_attempts=3), breaker=breaker)
+    await breaker.record_failure()
+    clock(10.0)
+
+    # The real failure, not a 503 about the gateway's own breaker.
+    with pytest.raises(ProviderUnavailable):
+        await wrapper.complete(chat_request())
+
+    assert inner.calls == 1, "one call per window, even with attempts to spare"
+    assert sleeps == [], "no backoff slept while holding the only slot"
+    assert await breaker.retry_after_seconds() == 20.0, "reopened for the escalated window"
+
+    clock(20.0)
+    await wrapper.complete(chat_request())
+    assert await breaker.state() is resilience.BreakerState.CLOSED, "and it still recovers"
+
+
+async def test_only_the_permit_holding_the_trial_can_hand_it_back(
+    clock: Callable[[float], None],
+) -> None:
+    """A call admitted while closed must not free the slot of the trial running now."""
+    breaker = CircuitBreaker(name="primary", failure_threshold=1, open_seconds=10.0)
+    admitted_while_closed = await breaker.allow()
+    assert admitted_while_closed is not None and not admitted_while_closed.trial
+
+    await breaker.record_failure()
+    clock(10.0)
+    trial = await breaker.allow()
+    assert trial is not None and trial.trial
+
+    await breaker.release_trial(admitted_while_closed)
+    assert await breaker.allow() is None, "the slot is still the trial's"
+
+    await breaker.release_trial(trial)
+    assert await breaker.allow() is not None, "its owner can hand it back"
+
+
+async def test_a_trial_permit_from_an_earlier_cycle_releases_nothing(
+    clock: Callable[[float], None],
+) -> None:
+    """Ownership is by identity, so last window's trial cannot free this window's."""
+    breaker = CircuitBreaker(name="primary", failure_threshold=1, open_seconds=10.0)
+    await breaker.record_failure()
+    clock(10.0)
+    first = await breaker.allow()
+    assert first is not None
+    await breaker.record_failure()  # the first trial fails: reopened for 20s
+    clock(20.0)
+    second = await breaker.allow()
+    assert second is not None and second is not first
+
+    await breaker.release_trial(first)
+    assert await breaker.allow() is None, "the second trial's slot survived"
+
+
+async def test_a_call_from_before_the_outage_cannot_free_the_trials_slot(
+    clock: Callable[[float], None],
+) -> None:
+    """Hanging up during half-open, a long call admitted while closed hands back nothing."""
+    upstream_answers = asyncio.Event()
+
+    class Slow:
         name = "primary"
 
         async def complete(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
-            raise asyncio.CancelledError
+            await upstream_answers.wait()
+            return await MockProvider(name=self.name).complete(request)
 
         def stream(self, request: ChatCompletionRequest) -> AsyncIterator[ChatCompletionChunk]:
             raise NotImplementedError
 
     breaker = CircuitBreaker(name="primary", failure_threshold=1, open_seconds=10.0)
-    wrapper = ResilientProvider(inner=Hangs(), policy=policy(), breaker=breaker)
+    wrapper = ResilientProvider(inner=Slow(), policy=policy(max_attempts=1), breaker=breaker)
+
+    before_outage = asyncio.create_task(wrapper.complete(chat_request()))
+    await asyncio.sleep(0)  # admitted while closed, now waiting on the upstream
     await breaker.record_failure()
     clock(10.0)
+    trial = asyncio.create_task(wrapper.complete(chat_request()))
+    await asyncio.sleep(0)  # the trial holds the slot
 
+    before_outage.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await wrapper.complete(chat_request())
+        await before_outage
 
-    assert await breaker.allow() is True, "the trial slot was released, not leaked"
+    assert await breaker.allow() is None, "still one trial at a time"
+    upstream_answers.set()
+    await trial
+    assert await breaker.state() is resilience.BreakerState.CLOSED
 
 
 async def test_state_is_a_pure_read(clock: Callable[[float], None]) -> None:
@@ -330,7 +456,7 @@ async def test_state_is_a_pure_read(clock: Callable[[float], None]) -> None:
     clock(10.0)
     assert await breaker.state() is resilience.BreakerState.OPEN
     assert await breaker.state() is resilience.BreakerState.OPEN, "reading changed nothing"
-    assert await breaker.allow() is True, "only allow() takes the trial"
+    assert await breaker.allow() is not None, "only allow() takes the trial"
 
 
 # --- the fallback chain -----------------------------------------------------

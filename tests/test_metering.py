@@ -27,9 +27,11 @@ from vortex_ai_gateway.keys import KeyStore
 from vortex_ai_gateway.metering import Meter
 from vortex_ai_gateway.pricing import DEFAULT_PRICES, PriceTable
 from vortex_ai_gateway.providers import MockProvider
+from vortex_ai_gateway.providers.base import ChatProvider
 from vortex_ai_gateway.providers.errors import ProviderUnavailable
 from vortex_ai_gateway.ratelimit import RateLimiter
 from vortex_ai_gateway.routes import _PENDING_SETTLEMENTS
+from vortex_ai_gateway.routing import build_router
 from vortex_ai_gateway.spend import SpendLedger
 
 CHAT_URL = "/v1/chat/completions"
@@ -50,7 +52,7 @@ def store(tmp_path: Path) -> KeyStore:
 def build(
     redis: aioredis.FakeRedis,
     store: KeyStore,
-    provider: MockProvider | None = None,
+    provider: ChatProvider | None = None,
     **overrides: object,
 ) -> TestClient:
     """A metered gateway, keyed from the store and backed by a fake Redis."""
@@ -125,21 +127,70 @@ def test_a_gateway_limit_is_told_apart_from_a_providers(
     assert throttled.json()["error"]["code"] == "gateway_rate_limit_exceeded"
 
 
-def test_a_request_larger_than_the_whole_token_allowance_is_refused(
+def test_a_request_larger_than_the_whole_token_allowance_is_a_400_with_nothing_to_wait_for(
     redis: aioredis.FakeRedis, store: KeyStore
 ) -> None:
-    """The token bucket rejects on its own, before the request bucket has anything to say."""
+    """It used to be a 429 whose Retry-After could never come true (ADR-031).
+
+    A bucket never holds more than its capacity, so the only thing that helps
+    is a smaller request — and every OpenAI SDK retries a 429 by itself.
+    """
     token = store.create(rpm=100, tpm=100).token
     provider = MockProvider()
     client = build(redis, store, provider, rate_limit_assumed_completion_tokens=500)
 
     response = client.post(CHAT_URL, json=BODY, headers=auth(token))
 
-    assert response.status_code == 429
-    assert response.headers["x-ratelimit-remaining-tokens"] == "100"
-    # And the refusal did not spend a request — the two buckets are one decision.
-    assert response.headers["x-ratelimit-remaining-requests"] == "100"
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["code"] == "request_exceeds_token_limit"
+    assert error["type"] == "invalid_request_error"
+    assert "100 tokens per minute" in error["message"]
+    assert "retry-after" not in response.headers
     assert provider.call_count == 0
+
+    # Decided before Redis was asked, so it spent nothing from either bucket.
+    smaller = client.post(CHAT_URL, json={**BODY, "max_completion_tokens": 50}, headers=auth(token))
+    assert smaller.status_code == 200
+    assert smaller.headers["x-ratelimit-remaining-requests"] == "99"
+
+
+@pytest.mark.parametrize(
+    ("max_completion_tokens", "expected"),
+    [(99, 200), (100, 400)],
+    ids=["exactly-capacity", "one-over"],
+)
+def test_a_request_exactly_the_size_of_the_allowance_still_fits(
+    redis: aioredis.FakeRedis, store: KeyStore, max_completion_tokens: int, expected: int
+) -> None:
+    """The refusal is for what can never fit; a full bucket holds exactly its capacity."""
+    token = store.create(rpm=100, tpm=100).token
+    client = build(redis, store)
+    payload = {**BODY, "max_completion_tokens": max_completion_tokens}  # "ping" is 1 token
+
+    assert client.post(CHAT_URL, json=payload, headers=auth(token)).status_code == expected
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streamed"])
+def test_an_unroutable_model_is_a_404_that_spends_nothing(
+    redis: aioredis.FakeRedis, store: KeyStore, stream: bool
+) -> None:
+    """Streamed, it was a 200 with an empty body that kept its reservation (ADR-032)."""
+    token = store.create(rpm=100, tpm=10_000).token
+    router = build_router(
+        Settings(_env_file=None, model_routes="gpt-*=openai", openai_api_key="sk-test")
+    )
+    client = build(redis, store, router, rate_limit_assumed_completion_tokens=1_000)
+    payload = {**BODY, "model": "mistral-large", "stream": stream}
+
+    refused = [client.post(CHAT_URL, json=payload, headers=auth(token)) for _ in range(3)]
+
+    assert [response.status_code for response in refused] == [404, 404, 404]
+    assert refused[-1].json()["error"]["code"] == "model_not_found"
+    assert remaining_tokens(refused[-1]) == remaining_tokens(refused[0]), (
+        "every reservation came back; a leak shows as ~1001 fewer per request"
+    )
+    assert client.get(USAGE_URL, headers=auth(token)).json()["total_requests"] == 0
 
 
 def test_limits_are_per_key(redis: aioredis.FakeRedis, store: KeyStore) -> None:
