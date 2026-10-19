@@ -244,6 +244,46 @@ def test_create_prints_the_token_once_and_a_warning(
     assert (record.name, record.rpm) == ("ci", 60)
 
 
+@pytest.mark.parametrize(
+    ("flags", "default_tpm", "warned"),
+    [
+        (["--tpm", "500"], "0", True),
+        (["--tpm", "512"], "0", True),
+        (["--tpm", "513"], "0", False),
+        ([], "300", True),
+        ([], "0", False),
+        (["--tpm", "150000"], "300", False),
+    ],
+    ids=["below", "equal", "above", "inherited-default", "unlimited", "flag-beats-default"],
+)
+def test_create_warns_about_a_token_limit_that_refuses_most_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    flags: list[str],
+    default_tpm: str,
+    warned: bool,
+) -> None:
+    """At or below the assumed completion, a request with no max_completion_tokens is a 400.
+
+    ADR-031 turned that request into a refusal; this catches the key before its
+    first one. The key is minted either way, and the token alone is on stdout.
+    """
+    # Set explicitly: the CLI reads Settings, which would otherwise read a `.env`.
+    monkeypatch.setenv("VORTEX_RATE_LIMIT_ASSUMED_COMPLETION_TOKENS", "512")
+    monkeypatch.setenv("VORTEX_RATE_LIMIT_DEFAULT_TPM", default_tpm)
+    path = tmp_path / "keys.sqlite3"
+
+    exit_code = cli.main(["--db", str(path), "create", *flags])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert KeyStore(path).verify(captured.out.strip()) is not None, "stdout is the token alone"
+    assert ("Warning:" in captured.err) is warned
+    if warned:
+        assert "max_completion_tokens" in captured.err
+
+
 def test_list_shows_limits_and_status(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     path = tmp_path / "keys.sqlite3"
     store = KeyStore(path)

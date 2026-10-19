@@ -56,9 +56,9 @@ translating that contract to and from its own format. `routing.py` maps model
 names onto providers from config and is itself a `ChatProvider`, so `create_app`
 mounts a router exactly where it would mount one adapter; with no routing table
 configured it falls back to the mock. `routes.py` owns the HTTP surface and the
-only place a provider failure becomes a status code — a stream's too, up to the
-moment the route returns, because it calls `stream()` before the `200` is
-committed (ADR-032). `streaming.py` owns what a
+only place a provider failure becomes a status code — a stream's too, because
+the route holds the `200` until the stream's first chunk is in hand (ADR-032).
+`streaming.py` owns what a
 stream *costs*: it asks every provider for usage regardless of what the caller
 requested, strips the usage chunk back out when the caller did not ask
 (ADR-018), and writes one `stream finished` record per streamed request —
@@ -73,7 +73,10 @@ retries and a breaker of its own, `FallbackProvider` tries an ordered chain.
 `router.providers` holds wrappers, not adapters — reach the adapter through
 `.inner` (ADR-001, ADR-002, ADR-020). The breaker's half-open trial is one
 call, and `allow()` returns a `Permit` so that only the call holding the
-trial slot can hand it back (ADR-030).
+trial slot can hand it back (ADR-030). A stream goes through the same loop
+as a completion — retries, breaker, hops — up to its first chunk and never
+after, so each wrapper's `stream()` is a generator that must close the
+stream it holds in a `finally` (ADR-032).
 
 `auth.py` answers *who is calling* and returns a `Principal`, never a token:
 `key_id` is public, stable, and safe to put in a Redis key or a log line, which

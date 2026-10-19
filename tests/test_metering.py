@@ -171,6 +171,27 @@ def test_a_request_exactly_the_size_of_the_allowance_still_fits(
     assert client.post(CHAT_URL, json=payload, headers=auth(token)).status_code == expected
 
 
+def test_a_stream_that_fails_before_its_first_chunk_spends_nothing(
+    redis: aioredis.FakeRedis, store: KeyStore
+) -> None:
+    """A status now, so released in full like its buffered twin, and no ledger row (ADR-032).
+
+    It used to be a 200 and an error event, settled by the SSE generator's
+    `finally`; the route now answers before that generator exists.
+    """
+    token = store.create(rpm=100, tpm=10_000).token
+    provider = MockProvider(replies=[ProviderUnavailable("down", provider="mock")])
+    client = build(redis, store, provider, rate_limit_assumed_completion_tokens=1_000)
+
+    failed = [
+        client.post(CHAT_URL, json={**BODY, "stream": True}, headers=auth(token)) for _ in range(2)
+    ]
+
+    assert [response.status_code for response in failed] == [502, 502]
+    assert remaining_tokens(failed[1]) == remaining_tokens(failed[0])
+    assert client.get(USAGE_URL, headers=auth(token)).json()["total_requests"] == 0
+
+
 @pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streamed"])
 def test_an_unroutable_model_is_a_404_that_spends_nothing(
     redis: aioredis.FakeRedis, store: KeyStore, stream: bool

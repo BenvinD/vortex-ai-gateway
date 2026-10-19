@@ -1,7 +1,8 @@
-## Day 14 — four places the gateway told someone something untrue
+## Day 14 — places the gateway told someone something untrue
 
 Part one is the breaker; part two, written after part one landed and before
-its own code, is three more that turned up beside it.
+its own code, is three more that turned up beside it; part three closes the
+two gaps part two left open.
 
 ### Part one — making sure the half-open trial always reports back
 
@@ -130,3 +131,66 @@ no `Retry-After` while a request exactly at capacity is still admitted; and
 each give-up reason reads 1 with every other reason at 0. The number to watch
 is the bucket after the unroutable streams. If it still drops, the reservation
 is being taken somewhere the new failure path does not reach.
+
+### Part three — a stream that waits for its first chunk, and a key that warns
+
+**Building.** Part two left two gaps, both written down rather than fixed.
+(1) An upstream `5xx`, `429`, timeout or bad key on a stream still arrives as an
+in-band error event after a `200`, because the route returns the
+`StreamingResponse` as soon as `stream()` hands back a generator, and the
+adapter only makes its HTTP request when that generator is first iterated. And
+none of those failures is retried or hopped: `ResilientProvider.stream` and
+`FallbackProvider.stream` forward the head's stream untouched, so the breaker
+never sees a stream at all. (2) `vortex-keys create --tpm 500` mints a key that
+refuses nearly every request (ADR-031), and says nothing.
+
+**Alternatives — when a stream commits to its `200`.** (1) When the route
+returns, as part two left it: a status for anything `stream()` raises
+synchronously, which is only routing. (2) At the first chunk with content: also
+catches a vendor that accepts and then fails before generating, but holds the
+status line through a reasoning model's whole think time. (3) At the first
+chunk of any kind: for OpenAI and the mock that is the role-only chunk, which
+already proves the request was accepted — auth, model, quota and `5xx` all
+surface before it. Chose (3) — see ADR-032, rewritten in place for this.
+No new timeout: a hung upstream already becomes `ProviderTimeout` from the
+adapter's own read timeout, so the wait is bounded by a setting that exists.
+
+**Alternatives — what a failure before the first chunk gets.** (1) A status
+code only, streams still outside the resilience wrappers: the smaller change,
+and it leaves the one window in which a stream *can* be retried unused. (2) The
+same retries, breaker and fallback hops `complete()` gets, all before the first
+chunk. Chose (2). Nothing has been sent, so a retry or a hop splices nothing —
+ADR-001's and ADR-020's reason for keeping streams out was about *after* the
+first chunk, and they named this as the condition to revisit. The breaker's
+verdict on a stream is the first chunk: arriving is a success, failing to
+arrive after the retries is a failure, and a failure *after* it moves nothing,
+because by then the upstream has demonstrably answered.
+
+**The awkward part: the retry loop has to live in two places, or be shared.**
+`ResilientProvider.complete` owns the loop — the permit, the trial rule, the
+`finally` that hands a slot back, the backoff, the single give-up report — and
+it took a day to make that loop correct. Copying it into `stream()` would make a
+second loop that drifts from the first. So the loop becomes generic over what
+one attempt *is*: for `complete()` it awaits the completion; for `stream()` it
+opens the stream and awaits its first chunk, returning both. The streaming
+wrapper is then a generator that calls the shared loop, yields the first chunk
+and relays the rest, closing the inner stream in a `finally` so a hang-up still
+reaches the adapter (ADR-019). `FallbackProvider` gets the same treatment: one
+loop over the chain, generic over the attempt. The cost is one more generator
+layer per wrapper between the client and the adapter, which the abandonment
+tests have to prove does not stop a cancellation reaching the upstream.
+
+**The key warning.** No alternatives worth pricing: ADR-031 named it. It
+prints to stderr after the token, so a script piping the token still gets only
+the token; it never refuses, because an operator may want a tiny key on
+purpose; and it checks the *effective* limit, so `--tpm 0` is judged by the
+deployment default it will inherit.
+
+**Planned experiment.** A scripted upstream that fails `503` twice and then
+streams. Prediction: three upstream calls, two backoffs, then a `200` whose
+body is the third call's chunks. With the upstream failing every time, a `502`
+with an error envelope and the reservation back in full, not a `200`. A stream
+that fails after its first chunk is not retried: one call, a `200`, the error
+as the final event. The number to watch is the upstream call count on the
+mid-stream failure. Two would mean the retry loop is running past the first
+chunk and splicing generations.

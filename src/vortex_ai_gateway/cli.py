@@ -76,6 +76,33 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _tpm_warning(tpm: int, settings: Settings) -> str | None:
+    """Why a key minted with this token limit will refuse most requests, if it will.
+
+    A request that sets no ``max_completion_tokens`` is estimated at its prompt
+    plus ``rate_limit_assumed_completion_tokens``, and an estimate above the
+    key's whole allowance is refused outright (ADR-031). Judged on the
+    *effective* limit, so ``--tpm 0`` is checked against the deployment default
+    it inherits. A warning, never a refusal: a tiny key may be deliberate.
+    """
+    effective = tpm or settings.rate_limit_default_tpm
+    assumed = settings.rate_limit_assumed_completion_tokens
+    if not 0 < effective <= assumed:
+        return None
+    source = (
+        f"--tpm {tpm}"
+        if tpm
+        else f"The deployment default of {effective} tokens (VORTEX_RATE_LIMIT_DEFAULT_TPM)"
+    )
+    return (
+        f"Warning: {source} is no more than the {assumed} tokens assumed for a "
+        "completion when a request sets no max_completion_tokens "
+        "(VORTEX_RATE_LIMIT_ASSUMED_COMPLETION_TOKENS), so nearly every such request "
+        "will be refused with a 400. Raise the limit, or have callers set "
+        "max_completion_tokens."
+    )
+
+
 def _resolve_db(explicit: str | None) -> str | None:
     """Where the keys live: the flag, else the environment, else nowhere."""
     if explicit:
@@ -105,6 +132,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         minted = store.create(name=args.name, rpm=args.rpm, tpm=args.tpm)
         print(minted.token)
         print(CREATED_NOTICE, file=sys.stderr)
+        warning = _tpm_warning(args.tpm, Settings())
+        if warning is not None:
+            print(warning, file=sys.stderr)
         return 0
 
     if args.command == "revoke":

@@ -26,7 +26,8 @@ bound.
 Consequences: The estimate, which ADR-021 calls deliberately crude, now has
 the power to refuse outright, but only above the whole allowance, and the
 message says how to get under it. A request exactly at capacity is still
-admitted. Not built: a warning from `vortex-keys create` when `--tpm` is below
-the assumed completion, which would catch the misconfigured key before its
+admitted. `vortex-keys create` warns, on stderr and without refusing, when the
+key's effective TPM — the flag, or the deployment default it inherits — is no
+more than the assumed completion, so the misconfigured key is caught before its
 first request. Revisit if callers routinely send `max_tokens` far above what
 they use: then C's debt is the honest answer, and worth two scripts.

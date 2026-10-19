@@ -1,4 +1,4 @@
-## Day 14 — four places the gateway told someone something untrue
+## Day 14 — places the gateway told someone something untrue
 Designed: [day-14 design note](../design/day-14.md)
 
 ### Part one — the half-open trial that never reported back
@@ -195,3 +195,114 @@ test asserted something true but incomplete: that a refusal happened, not that
 its advice worked; that the right counter moved, not that the wrong one
 didn't. So I now write refusal tests against everything the response claims,
 and I check each fix by putting the old code back to see which test goes red.
+
+### Part three — a stream that waits for its first chunk, and a key that warns
+
+Built:
+- `providers/resilience_wrapper.py` — both retry loops are generic over what
+  one attempt *is*: `ResilientProvider._call` and
+  `FallbackProvider._first_to_serve` take an awaitable factory, `complete()`
+  passes "await the completion", and `stream()` passes `_open`, which opens the
+  stream and awaits its first chunk. Each wrapper's `stream()` is now a
+  generator that yields that chunk, relays the rest untouched, and closes the
+  inner stream in a `finally`. The breaker's verdict on a stream is its first
+  chunk (ADR-032).
+- `routes.py` — the route awaits the first chunk inside a new `provider.stream`
+  span before it builds the `StreamingResponse`. A failure there is a status
+  through `_failed`, with a `failed` stream record. A cancellation there is
+  recorded as `abandoned` and settled as one. `_settle_stream` lost its
+  "failed with no chunks" branch, because nothing that reaches it can be that
+  any more.
+- `cli.py` — `vortex-keys create` warns on stderr when the key's effective TPM,
+  meaning the flag or the default it inherits, is no more than the assumed
+  completion. The token is still the only thing on stdout.
+- Tests: scripted streams for retry-until-first-chunk, the breaker tripping on
+  streams that never start, no retry after the first chunk, and hop-before
+  versus never-after; HTTP-level `502`-then-`503` and retry-to-`200`; a
+  pre-first-chunk failure with metering live; a cancellation during the wait;
+  a hang-up through both wrappers; the wrappers' `finally`; six cases for the
+  key warning. The old in-band error test now fails *after* a chunk, which is
+  the only place an in-band error can still happen.
+- ADR-032 rewritten in place, as decided, so part two's references to it
+  describe its first version. ADR-031's consequences, dated updates on ADR-001
+  and ADR-020, three index rows, `AGENTS.md` and `docs/architecture.md`.
+
+The planned experiment, through the real route, router, `ResilientProvider` and
+OpenAI adapter against a respx upstream, run on the committed code (a detached
+worktree of `HEAD` on `PYTHONPATH`) and on the working tree:
+
+| Upstream | Before | After |
+|---|---|---|
+| `503`, `503`, then a stream | `200`, 1 upstream call, an error event, no text | `200`, 3 calls, `'hello'`, no error |
+| `503` every time | `200`, 1 call, an error event | `502`, 3 calls, the error as an envelope |
+| the next request | `200`, called the dead upstream again | `503`, `Retry-After: 59`, no call |
+| fails after its first chunk (doubles) | — | `200`, 1 call, the error as the final event |
+
+```
+$ vortex-keys --db … create --name tiny --tpm 500
+Store this token now. Only its hash is kept, so it cannot be shown again.
+Warning: --tpm 500 is no more than the 512 tokens assumed for a completion when
+a request sets no max_completion_tokens (…), so nearly every such request will
+be refused with a 400. Raise the limit, or have callers set max_completion_tokens.
+vtx_efba90da4795_…
+```
+
+**Broke: predicted the experiment, and got it; then a test written to prove one
+guarantee turned out to prove nothing about it.** Re-breaking the fix one piece
+at a time:
+
+| Fix removed | Tests that failed |
+|---|---|
+| the route awaiting the first chunk | 4: the pre-first-chunk status, `502`-then-`503`, the metered release, the cancellation record |
+| `ResilientProvider.stream` using the shared loop | 4: both retry tests, the breaker test, `502`-then-`503` |
+| the `abandoned` record on a cancelled wait | 1 |
+| the wrappers' `finally` closing the inner stream | **0** |
+
+`test_a_hang_up_reaches_the_adapter_through_the_resilience_wrappers` was
+written for the fourth row, and passed with that `finally` deleted. In that
+test the cancellation lands inside the adapter, which is awaiting its
+upstream, so the adapter unwinds itself and the wrapper is never asked to close
+anything. The `finally` matters only when the relay is suspended at a `yield`.
+Even then, removing it does not leak for long: asyncio's async-generator
+finalizer closes the abandoned adapter a loop turn later, so no end-to-end
+test can tell the difference. The fix is a unit test that closes the wrapped
+stream at a `yield` and asserts in the same instant `aclose()` returns. It
+failed for both wrappers with the `finally` gone. The hang-up test keeps a
+docstring that now says what it does *not* prove.
+
+**Broke, in part two's test, found in part three.** Running
+`test_resilience.py` before `test_metrics.py` failed the give-up test from part
+two: `capture_logs()` saw no lines. The cause has two halves. `gateway.py` runs
+`app = create_app()` at import, which configures structlog with
+`cache_logger_on_first_use=True` before the first test starts. So whichever
+test first logs through `resilience_wrapper` caches that logger for the rest of
+the session, and `capture_logs()` cannot see a cached logger. The suite's
+alphabetical order runs `test_metrics.py` first, which is the only reason it
+passed. The test now swaps in its own `LogCapture` logger, and both orders
+pass. The import-time configuration is left as it is and written down here: it
+is the same kind of leak `conftest.py`'s `_reset_structlog` exists for, from
+before the first test, where that fixture cannot reach.
+
+Learned: when the runtime eventually provides a guarantee itself, as the
+garbage collector does by closing a dropped generator, an end-to-end test
+cannot tell code that provides it from code that leaves it to the runtime.
+Only an assertion at the moment the guarantee is owed can. And a test that
+touches global state has not been shown to pass until it has passed out of
+suite order.
+
+**One paragraph I could say in an interview.** Streams were the gap in my
+gateway's resilience. The route committed the `200` as soon as it had a
+generator, but the adapter makes its HTTP request only when that generator is
+first iterated. So every upstream `5xx` became a `200` with an error event, and
+the retry loop, the breaker and the fallback chain never saw a stream at all. I
+moved the commit point to the first chunk and made both resilience loops
+generic over what one attempt is: a completion, or "open the stream and await
+its first chunk". Streams got exactly the retries, breaker verdicts and hops
+completions have, in the one window where retrying can't splice two
+generations together. Against a dead upstream that turned "`200` with an
+error, every time" into a `502` and then a `503` with `Retry-After`. The part
+I'd want to be judged on is what deliberately breaking it showed. The test I'd
+written to prove a hang-up reaches the adapter through the wrappers passed with
+the relevant code deleted, because asyncio's generator finalizer closes the
+adapter a moment later anyway. Only a unit test asserting at the instant of
+`aclose()` could tell my code from the runtime's safety net.

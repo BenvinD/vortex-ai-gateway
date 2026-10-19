@@ -260,18 +260,36 @@ def create_chat_router(
             )
 
         if request.stream:
+            # Created before the wait, so its duration is the whole request and
+            # every streamed request writes one record however it ends.
+            record = StreamRecord(provider=provider.name, model=request.model)
             try:
-                # Asked for here, before the `200` is committed, and never
-                # inside the body generator: the router raises an unroutable
-                # model from `stream()` itself so it can still be a `404`, and
-                # the body only runs once the status line is on the wire
-                # (ADR-032). The gateway asks for usage on every stream; only
-                # the forwarding is conditional. See `streaming.metered`.
-                stream = provider.stream(metered(request))
+                # The `200` is held until the first chunk is in hand (ADR-032).
+                # Until then nothing has been sent: an unroutable model, an
+                # open breaker, or an upstream that fails even after the
+                # retries and hops the wrappers apply is a status code, exactly
+                # as on the buffered path. The gateway asks for usage on every
+                # stream; only the forwarding is conditional (`streaming.metered`).
+                with span(
+                    "provider.stream",
+                    {"vortex.provider": provider.name, "vortex.model": request.model},
+                ):
+                    stream = provider.stream(metered(request))
+                    first = await anext(stream, None)
+            except asyncio.CancelledError:
+                # Cancelled while waiting — a shutdown, or anything above us
+                # giving up. The same trail as a stream abandoned mid-way: the
+                # upstream may already have been paid for the prompt (ADR-019).
+                record.outcome = "abandoned"
+                record.log()
+                await _settle_stream(meter, reservation, record)
+                raise
             except Exception as exc:
+                record.outcome = "failed"
+                record.log()
                 return await _failed(exc, provider, request, meter, reservation, headers)
             return StreamingResponse(
-                _stream_events(provider, request, stream, meter, reservation),
+                _stream_events(provider, request, record, stream, first, meter, reservation),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-store",
@@ -390,14 +408,18 @@ def _today() -> str:
 async def _stream_events(
     provider: ChatProvider,
     request: ChatCompletionRequest,
+    record: StreamRecord,
     stream: AsyncIterator[ChatCompletionChunk],
+    first: ChatCompletionChunk | None,
     meter: Meter,
     reservation: Reservation,
 ) -> AsyncIterator[str]:
     """Yield the SSE body for a streaming completion.
 
-    ``stream`` was asked for by the route, before the ``200`` (ADR-032); by
-    the time this runs, the only way left to report a failure is an event.
+    The route has already awaited ``first`` — ``None`` for a stream that ended
+    without a chunk — and committed the ``200`` on the strength of it
+    (ADR-032). By the time this runs, the only way left to report a failure is
+    an event.
 
     Three ways this ends, and all three have to leave the same trail — a
     :class:`~vortex_ai_gateway.streaming.StreamRecord` naming what the request
@@ -418,14 +440,20 @@ async def _stream_events(
     branch already misses them, and a reader should not have to know that to
     see that an abandonment is handled.
     """
-    record = StreamRecord(provider=provider.name, model=request.model)
     forward_usage = wants_usage(request)
+
+    def event(chunk: ChatCompletionChunk) -> str | None:
+        """Account for ``chunk`` and frame what the caller should be sent."""
+        forwarded = record.observe(chunk, forward_usage=forward_usage)
+        return None if forwarded is None else _sse(forwarded.model_dump_json(exclude_none=True))
+
     try:
         try:
+            if first is not None and (framed := event(first)) is not None:
+                yield framed
             async for chunk in stream:
-                forwarded = record.observe(chunk, forward_usage=forward_usage)
-                if forwarded is not None:
-                    yield _sse(forwarded.model_dump_json(exclude_none=True))
+                if (framed := event(chunk)) is not None:
+                    yield framed
         except asyncio.CancelledError, GeneratorExit:
             record.outcome = "abandoned"
             raise
@@ -455,11 +483,11 @@ _PENDING_SETTLEMENTS: set[asyncio.Task[None]] = set()
 async def _settle_stream(meter: Meter, reservation: Reservation, record: StreamRecord) -> None:
     """Release the stream's reservation and record what it actually cost.
 
-    A stream that failed before its first chunk generated nothing, so its
-    reservation comes back in full. Any other ending produced tokens — possibly
-    a number nobody has, which
-    :meth:`~vortex_ai_gateway.metering.Meter.settle` records as *unmetered*
-    rather than as free.
+    Every ending that reaches here may have produced tokens — possibly a
+    number nobody has, which :meth:`~vortex_ai_gateway.metering.Meter.settle`
+    records as *unmetered* rather than as free. A stream that failed before its
+    first chunk never gets here: the route answers it with a status and
+    releases its reservation in full, as it does a buffered failure (ADR-032).
 
     The abandoned case is spawned rather than awaited, and that asymmetry is the
     whole point of this function existing. For an abandoned stream this code
@@ -474,11 +502,7 @@ async def _settle_stream(meter: Meter, reservation: Reservation, record: StreamR
     Every other ending is awaited in place, where nothing is cancelling anything
     and the write landing before the response ends is worth having.
     """
-    if record.chunks == 0 and record.outcome == "failed":
-        settling = meter.discard(reservation)
-    else:
-        settling = meter.settle(reservation, record.usage)
-
+    settling = meter.settle(reservation, record.usage)
     if record.outcome != "abandoned":
         await settling
         return

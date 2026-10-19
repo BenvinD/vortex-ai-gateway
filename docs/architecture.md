@@ -54,10 +54,12 @@ flowchart TD
     class redis,settle store
 ```
 
-A streaming request takes the same path with two differences: the cache reports
-`BYPASS` without looking (ADR-004), and settlement moves into the SSE
-generator's `finally`, because a stream's cost is only known once it has ended —
-and it has three endings (ADR-019).
+A streaming request takes the same path with three differences: the cache
+reports `BYPASS` without looking (ADR-004); the `200` waits for the stream's
+first chunk, which the wrappers retry and hop for exactly as they do a
+completion (ADR-032); and settlement moves into the SSE generator's `finally`,
+because a stream's cost is only known once it has ended — and it has three
+endings (ADR-019).
 
 ## Box by box
 
@@ -194,7 +196,7 @@ per-replica file gives every replica its own private routing table. When runtime
 mutation is genuinely needed here the store is Redis, and it is a change to
 `build_router` alone.
 
-### 7. `ResilientProvider` / `FallbackProvider` — ADR-001, ADR-002, ADR-020, ADR-030
+### 7. `ResilientProvider` / `FallbackProvider` — ADR-001, ADR-002, ADR-020, ADR-030, ADR-032
 
 **Does.** Wraps every adapter, before the router ever sees it, in its own retry
 loop and its own circuit breaker; `FallbackProvider` tries an ordered chain.
@@ -218,7 +220,10 @@ everyone. The half-open trial is one call, and its slot has an owner:
 breaker refusing everyone with no clock running. Fallback hops only on
 `CircuitOpenError` or exhausted retries — never on a `400`, which would fail
 everywhere and spend a second provider's quota to return the same error more
-slowly.
+slowly. A stream runs the same loops, generic over what one attempt is, up to
+its first chunk: that chunk is the breaker's verdict, and nothing after it is
+retried or hopped, because a second attempt would splice two generations into
+one body.
 
 **Rejected.** Automatic failover on any error. Also deliberately not built:
 per-hop model rewriting, which needs syntax; and `UnsupportedParameterError` is
@@ -301,7 +306,7 @@ down.
 | Ending | Buffered | Streamed |
 |---|---|---|
 | Success | `200` + envelope, settled with real usage | chunks, `[DONE]`, settled in the generator's `finally` |
-| Provider failure | `502`/`504`/`429`… + error envelope, reservation released in full | raised by `stream()` itself — an unroutable model — it is the buffered row exactly, because the route asks for the stream before the `200` (ADR-032); after that the `200` is on the wire, so the error is one final SSE event before `[DONE]` |
+| Provider failure | `502`/`504`/`429`… + error envelope, reservation released in full | before the first chunk — after the same retries and hops — it is the buffered row exactly, because the `200` waits for that chunk (ADR-032); after it the `200` is on the wire, so the error is one final SSE event before `[DONE]` |
 | Client hangs up | nothing to do | cancellation is recorded, re-raised into the provider's generator to close the upstream, and settled as *unmetered* on a spawned task — because the scope is already cancelled and awaiting Redis there loses precisely the settlement that matters (ADR-019) |
 
 ## Reading order

@@ -15,10 +15,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import structlog
 import yaml
 from fakeredis import aioredis
 from fastapi import FastAPI
-from structlog.testing import capture_logs
+from structlog.testing import LogCapture
 
 from tests.test_cache import body, client_for
 from tests.test_resilience import ScriptedProvider, resilient
@@ -36,7 +37,7 @@ from vortex_ai_gateway.gateway import create_app
 from vortex_ai_gateway.metering import Meter
 from vortex_ai_gateway.metrics import OVERFLOW, UNKNOWN, LabelBudget
 from vortex_ai_gateway.pricing import PriceTable
-from vortex_ai_gateway.providers import CannedReply, MockProvider
+from vortex_ai_gateway.providers import CannedReply, MockProvider, resilience_wrapper
 from vortex_ai_gateway.providers.errors import ProviderBadRequest, ProviderUnavailable
 from vortex_ai_gateway.providers.resilience_wrapper import (
     GAVE_UP_BUDGET,
@@ -403,7 +404,10 @@ async def test_a_non_retryable_failure_is_one_attempt_and_no_retries() -> None:
     ids=["attempts", "budget", "deadline"],
 )
 async def test_each_way_to_give_up_is_counted_once_under_its_own_reason(
-    sleeps: list[float], reason: str, overrides: dict[str, object]
+    sleeps: list[float],
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+    overrides: dict[str, object],
 ) -> None:
     """Each means something different is wrong; one counter would hide which.
 
@@ -413,8 +417,16 @@ async def test_each_way_to_give_up_is_counted_once_under_its_own_reason(
     right reason read 1 never noticed the wrong one reading 1 as well.
     """
     inner = ScriptedProvider(ProviderUnavailable("down", provider="primary"))
+    # Swapped in rather than captured globally. `capture_logs()` cannot see a
+    # logger structlog has already cached, and the import-time `create_app()`
+    # in `gateway.py` turns caching on before the first test runs — so whether
+    # it saw anything depended on which test first logged through this module.
+    captured = LogCapture()
+    monkeypatch.setattr(
+        resilience_wrapper, "logger", structlog.wrap_logger(None, processors=[captured])
+    )
 
-    with capture_logs() as logs, pytest.raises(ProviderUnavailable):
+    with pytest.raises(ProviderUnavailable):
         await resilient(inner, **overrides).complete(chat_request())
 
     every_reason = (GAVE_UP_EXHAUSTED, GAVE_UP_BUDGET, GAVE_UP_DEADLINE, GAVE_UP_TRIAL)
@@ -423,7 +435,7 @@ async def test_each_way_to_give_up_is_counted_once_under_its_own_reason(
         for r in every_reason
     }
     assert counts == {**dict.fromkeys(every_reason, 0.0), reason: 1.0}
-    give_ups = [entry for entry in logs if entry["event"] == GIVE_UP_EVENT]
+    give_ups = [entry for entry in captured.entries if entry["event"] == GIVE_UP_EVENT]
     assert len(give_ups) == 1, "one give-up, one line"
     assert give_ups[0]["reason"] == reason
     assert give_ups[0]["attempts"] == inner.calls, "the attempts actually made"
