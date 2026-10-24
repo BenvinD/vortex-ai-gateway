@@ -10,7 +10,8 @@ from fastapi.testclient import TestClient
 
 from vortex_ai_gateway.config import Settings
 from vortex_ai_gateway.gateway import create_app
-from vortex_ai_gateway.providers import OpenAIAdapter
+from vortex_ai_gateway.providers import MockProvider, OpenAIAdapter
+from vortex_ai_gateway.routing import RoutingConfigError
 
 
 @pytest.fixture
@@ -23,8 +24,27 @@ def client() -> TestClient:
 def test_create_app_stores_injected_settings() -> None:
     """The factory keeps the passed-in settings on ``app.state``."""
     settings = Settings(_env_file=None, environment="prod", api_keys="k")
-    app = create_app(settings=settings)
+    app = create_app(settings=settings, provider=MockProvider())
     assert app.state.settings is settings
+
+
+@pytest.mark.parametrize("environment", ["staging", "prod"])
+def test_a_guarded_environment_with_no_routing_table_refuses_to_boot(environment: str) -> None:
+    """The mock's canned 200s at $0 raise no error and no alert there (ADR-035)."""
+    settings = Settings(_env_file=None, environment=environment, api_keys="k")
+
+    with pytest.raises(RoutingConfigError, match="VORTEX_MODEL_ROUTES"):
+        create_app(settings=settings)
+
+
+async def test_a_guarded_environment_boots_with_a_routing_table() -> None:
+    settings = Settings(
+        _env_file=None, environment="prod", api_keys="k", model_routes="local/*=ollama"
+    )
+    app = create_app(settings=settings)
+
+    async with app.router.lifespan_context(app):
+        assert not isinstance(app.state.provider, MockProvider)
 
 
 async def _noop() -> None:

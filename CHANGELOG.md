@@ -5,6 +5,48 @@ All notable changes to this project are recorded here. The format follows
 [Semantic Versioning](https://semver.org/). Every decision named below has an
 ADR in [`docs/adr/`](docs/adr/README.md).
 
+## [0.1.1] — 2026-10-24
+
+A hardening release. The failure paths now return the right status code
+quickly enough to act on, and a misconfigured staging or prod deployment
+refuses to start instead of serving.
+
+### Changed — may need action on upgrade
+
+- **Staging and prod refuse to boot open.** With `VORTEX_ENVIRONMENT` set to
+  `staging` or `prod`, `create_app` raises `OpenGatewayError` when no key
+  source is configured, and `RoutingConfigError` when there is no routing
+  table and the gateway would otherwise serve the mock provider (ADR-035).
+- **Rate-limiter keys are hash-tagged** as `vortex:rl:{key_id}:…`. Every
+  bucket starts full once after the deploy. Redis Cluster is still not
+  supported, because the client is a plain `Redis` (ADR-021).
+
+### Fixed
+
+- **The circuit breaker no longer sticks in half-open.** A trial call that
+  failed with a retryable error used to leave the breaker refusing every call
+  until restart. `allow()` now returns a `Permit`: a failed trial reopens the
+  breaker immediately, and the slot is always released (ADR-030).
+- **Streams get the same retries, breaker and fallback as completions,** up to
+  the first chunk. Before that point a failure gets a real status code: an
+  unknown streamed model now gets a `404` instead of an empty `200` (ADR-032).
+- **`Retry-After` is rounded up and never `0`.**
+- **Unhandled exceptions return a JSON `500`** in the error envelope, and its
+  `X-Request-ID` matches the log line that carries the traceback.
+
+### Added
+
+- **Bounded Redis calls.** Each Redis call has a 0.25 s socket timeout and a
+  0.5 s connect timeout, so failing open actually happens. A stalled Redis
+  adds about 1.25 s to a request, and a black-holed route about 2.5 s
+  (ADR-033).
+- **A 10 MiB request-body limit** that returns `413` before auth, for both
+  `Content-Length` and chunked bodies (ADR-034).
+- **A `400` for a request estimated above the key's whole TPM**, where it
+  used to get a `429` that no wait could clear. `vortex-keys create` warns
+  when it mints such a key (ADR-031).
+- A Postman collection with local, demo, staging and production environments.
+
 ## [0.1.0] — 2026-09-24
 
 The first release: an OpenAI-compatible gateway that routes, limits, caches,
@@ -103,4 +145,5 @@ runs end to end on a built-in mock provider, with no Redis and no vendor keys.
 - Not yet built: PII guardrails, a number/unit/entity guard in front of the
   semantic tier, and Redis-backed load balancing.
 
+[0.1.1]: https://github.com/BenvinD/vortex-ai-gateway/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/BenvinD/vortex-ai-gateway/releases/tag/v0.1.0

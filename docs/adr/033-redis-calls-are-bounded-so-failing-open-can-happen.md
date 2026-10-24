@@ -24,3 +24,8 @@ dataset — now fails open for its duration rather than being waited for, which
 lets requests through unmetered. Revisit with C if a degraded Redis's ~1.25 s
 a request shows up in the latency SLO, or raise the budgets if Redis lives
 across a link where 0.25 s is not generous.
+Update (2026-10-24): "~1.25 s a request" holds for one failure mode only. A
+Redis that accepts and stalls costs the read budget per call: 5 × 0.25 s ≈
+1.25 s. A black-holed route, where the connection attempt is silently dropped,
+costs the connect budget per call instead, measured at 0.5 s each, so a miss
+there is about 2.5 s. A Redis that refuses connections costs neither.

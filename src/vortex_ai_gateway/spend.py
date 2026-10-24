@@ -18,7 +18,8 @@ turned a served request into a 500 would lose the answer *and* the record; a
 Redis outage that drops the record loses only the record, and says so.
 
 Keys are ``vortex:usage:<key_id>:<YYYY-MM-DD>`` — one hash per key per UTC day,
-holding three fields per model. A day is the coarsest bucket that still answers
+holding four fields per model: requests, unmetered requests, prompt tokens and
+completion tokens. A day is the coarsest bucket that still answers
 "what changed yesterday?", and a hash per day is what makes retention a TTL
 rather than a sweep.
 """

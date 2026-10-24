@@ -20,7 +20,7 @@ from redis.asyncio import Redis
 from starlette.responses import PlainTextResponse
 
 from vortex_ai_gateway import __version__, metrics
-from vortex_ai_gateway.auth import ensure_key_source
+from vortex_ai_gateway.auth import GUARDED_ENVIRONMENTS, ensure_key_source
 from vortex_ai_gateway.cache import ResponseCache
 from vortex_ai_gateway.config import Settings, get_settings
 from vortex_ai_gateway.embedding import build_embedder
@@ -37,7 +37,7 @@ from vortex_ai_gateway.pricing import PriceTable
 from vortex_ai_gateway.providers import ChatProvider, MockProvider
 from vortex_ai_gateway.ratelimit import RateLimiter
 from vortex_ai_gateway.routes import create_chat_router
-from vortex_ai_gateway.routing import build_router
+from vortex_ai_gateway.routing import RoutingConfigError, build_router
 from vortex_ai_gateway.semantic import Embedder, SemanticCache
 from vortex_ai_gateway.spend import SpendLedger
 from vortex_ai_gateway.tracing import configure_tracing, shutdown_tracing
@@ -64,6 +64,8 @@ def create_app(
     the endpoint is exercisable end to end with no key and no bill — a
     substitution loud enough to be caught in the logs, since a deployment
     answering from canned replies is the worst failure this service could have.
+    In ``staging`` and ``prod`` it is refused outright with
+    :class:`~vortex_ai_gateway.routing.RoutingConfigError` (ADR-035).
 
     ``redis`` backs the rate limiter, the usage ledger and the response cache.
     Left out, it is opened from ``settings.redis_url`` when ``metering_enabled``
@@ -106,6 +108,15 @@ def create_app(
     if provider is None:
         provider = build_router(settings)
     if provider is None:
+        # The mock answers every request with a 200 priced at $0, so nothing
+        # errors and nothing alerts: in staging or prod that is found later
+        # than an open gateway would be (ADR-035).
+        if settings.environment in GUARDED_ENVIRONMENTS:
+            raise RoutingConfigError(
+                f"VORTEX_ENVIRONMENT={settings.environment} with neither VORTEX_MODEL_ROUTES "
+                "nor VORTEX_DEFAULT_PROVIDER set would serve the mock provider's canned "
+                "replies. Configure a route, or run with VORTEX_ENVIRONMENT=dev."
+            )
         provider = MockProvider()
         structlog.get_logger(__name__).warning(
             "no provider configured; serving canned replies",
