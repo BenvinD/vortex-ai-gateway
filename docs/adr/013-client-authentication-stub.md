@@ -31,3 +31,14 @@ deployment: a `prod` environment with neither source set is the check this repo
 still owes. Keys are compared in plaintext and are not scoped,
 rate-limited, or attributable to a tenant yet. C stays viable and would make
 this redundant, at the cost of the gateway not being deployable on its own.
+Update (2026-10-24): "Auth runs before body validation" was true of the schema
+and not of the JSON. FastAPI reads the whole body, and decodes it when its
+`Content-Type` is JSON, before it resolves any dependency; schema errors are
+collected and raised after them. So with no key, a body labelled JSON that does
+not parse is a `400`, while one labelled anything else, or JSON that fails the
+schema, is still a `401`. The intent holds — an unauthenticated caller learns nothing
+about whether a payload is *valid*, only that its bytes were not JSON, which it
+already knew — so this is recorded rather than fixed; moving auth into ASGI
+middleware to restore the old wording would buy nothing for that. What the
+wording hid is cost: every request's body is read in full before anyone checks
+the key, and nothing capped its size until ADR-034. `tests/test_auth.py` pins the ordering.

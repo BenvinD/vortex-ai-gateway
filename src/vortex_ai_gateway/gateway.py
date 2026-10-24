@@ -27,7 +27,11 @@ from vortex_ai_gateway.error_handling import install_error_handlers
 from vortex_ai_gateway.keys import KeyStore
 from vortex_ai_gateway.logging_config import configure_logging
 from vortex_ai_gateway.metering import Meter
-from vortex_ai_gateway.middleware import RequestIDMiddleware, TelemetryMiddleware
+from vortex_ai_gateway.middleware import (
+    BodyLimitMiddleware,
+    RequestIDMiddleware,
+    TelemetryMiddleware,
+)
 from vortex_ai_gateway.pricing import PriceTable
 from vortex_ai_gateway.providers import ChatProvider, MockProvider
 from vortex_ai_gateway.ratelimit import RateLimiter
@@ -203,7 +207,9 @@ def create_app(
     # Order matters and reads backwards: `add_middleware` prepends, so the
     # *last* one added is the outermost. `RequestIDMiddleware` has to be
     # outside, because it clears structlog's context vars on entry and would
-    # wipe the trace IDs `TelemetryMiddleware` binds (ADR-026).
+    # wipe the trace IDs `TelemetryMiddleware` binds (ADR-026). The body limit
+    # is innermost so its `413` is logged, counted and carries the request ID.
+    app.add_middleware(BodyLimitMiddleware, max_bytes=settings.max_request_body_bytes)
     app.add_middleware(TelemetryMiddleware)
     app.add_middleware(RequestIDMiddleware)
     install_error_handlers(app)

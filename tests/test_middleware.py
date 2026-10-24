@@ -1,6 +1,7 @@
 """Tests for the request-ID middleware."""
 
 import json
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -12,7 +13,7 @@ from fastapi.testclient import TestClient
 from tests.test_cache import CHAT_URL, body, build, client_for
 from vortex_ai_gateway.config import Settings
 from vortex_ai_gateway.gateway import create_app
-from vortex_ai_gateway.middleware import RequestIDMiddleware
+from vortex_ai_gateway.middleware import BodyLimitMiddleware, RequestIDMiddleware
 from vortex_ai_gateway.providers import MockProvider
 
 
@@ -181,3 +182,73 @@ async def test_the_hit_rate_is_recoverable_from_the_log_lines_alone(
 
     assert outcomes == ["MISS", "HIT", "HIT", "BYPASS"]
     assert hits / lookups == pytest.approx(2 / 3)
+
+
+def _limited(max_bytes: int, provider: MockProvider) -> TestClient:
+    """A gateway with a body limit and a key it will never be shown."""
+    settings = Settings(_env_file=None, api_keys="real-key", max_request_body_bytes=max_bytes)
+    return TestClient(create_app(settings=settings, provider=provider))
+
+
+def _chunks(payload: bytes) -> Iterator[bytes]:
+    """A body with no Content-Length, so httpx sends it chunked."""
+    for start in range(0, len(payload), 16):
+        yield payload[start : start + 16]
+
+
+@pytest.mark.parametrize("chunked", [False, True], ids=["content-length", "chunked"])
+def test_a_body_over_the_limit_is_a_413_before_the_key_is_checked(chunked: bool) -> None:
+    """No key is sent, and the answer is still 413: the limit runs before auth (ADR-034)."""
+    payload = json.dumps(body()).encode()
+    provider = MockProvider()
+    client = _limited(len(payload) - 1, provider)
+
+    response = client.post(
+        CHAT_URL,
+        content=_chunks(payload) if chunked else payload,
+        headers={"Content-Type": "application/json", "X-Request-ID": "too-big-1"},
+    )
+
+    assert response.status_code == 413
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "request_body_too_large"
+    assert response.headers["x-request-id"] == "too-big-1"
+    assert provider.call_count == 0
+
+
+@pytest.mark.parametrize("chunked", [False, True], ids=["content-length", "chunked"])
+def test_a_body_exactly_at_the_limit_is_served_intact(chunked: bool) -> None:
+    """The buffered body reaches the route byte for byte, however it arrived."""
+    payload = json.dumps(body()).encode()
+    provider = MockProvider()
+    client = _limited(len(payload), provider)
+
+    response = client.post(
+        CHAT_URL,
+        content=_chunks(payload) if chunked else payload,
+        headers={"Content-Type": "application/json", "Authorization": "Bearer real-key"},
+    )
+
+    assert response.status_code == 200
+    assert provider.received_requests[0].model_dump(exclude_unset=True) == body()
+
+
+async def test_a_client_that_hangs_up_mid_body_is_replayed_to_the_app_as_it_arrived() -> None:
+    """The disconnect reaches the app in order, as it would with no limit in front."""
+    arriving: list[dict[str, Any]] = [
+        {"type": "http.request", "body": b'{"mod', "more_body": True},
+        {"type": "http.disconnect"},
+    ]
+    seen: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return arriving.pop(0)
+
+    async def downstream(scope: object, receive: Any, send: object) -> None:
+        seen.extend([await receive(), await receive()])
+
+    middleware = BodyLimitMiddleware(downstream, max_bytes=1024)
+    await middleware({"type": "http", "headers": []}, receive, _noop)
+
+    assert [message["type"] for message in seen] == ["http.request", "http.disconnect"]

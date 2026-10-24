@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     # (docs/notes/day-04.md).
     connect_timeout_seconds: float = 5.0
 
+    # The largest request body accepted, in bytes; anything larger is a `413`
+    # before the API key is checked. A 128k-token prompt is about half a
+    # megabyte of text, so the default is room for a few inline base64 images
+    # on top. Raise it for image-heavy traffic (ADR-034).
+    max_request_body_bytes: Annotated[int, Field(ge=1)] = 10 * 1024 * 1024
+
     # Client API keys accepted at the edge, comma-separated. Kept as a plain
     # string rather than a set because pydantic-settings parses collection
     # types from env vars as JSON, which is a hostile format for an operator

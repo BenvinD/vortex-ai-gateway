@@ -154,10 +154,13 @@ until `span()` learned to return a shared inert one (ADR-029, `bench/`).
 `configure_tracing` returns *ownership*, not liveness, because OTel's provider
 is a process global that refuses replacement.
 
-`middleware.py` now holds two raw-ASGI middlewares and their order is
+`middleware.py` now holds three raw-ASGI middlewares and their order is
 load-bearing: `RequestIDMiddleware` is outermost because it clears structlog's
 context vars on entry, and `TelemetryMiddleware` sits just inside so the trace
-and span IDs land in the same context the request ID rides in. The telemetry
+and span IDs land in the same context the request ID rides in.
+`BodyLimitMiddleware` is innermost and refuses an oversized body with a `413`
+before FastAPI buffers it — and so before the API key is checked, because
+FastAPI reads the body before any dependency runs (ADR-013, ADR-034). The telemetry
 middleware opens the server span, records the request counters and histograms,
 and measures time to first token — which is the gap to the first
 `http.response.body` message carrying bytes, and is the one thing no other

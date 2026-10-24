@@ -1,6 +1,6 @@
 """ASGI middleware for the gateway.
 
-Two, and the order they are mounted in is load-bearing.
+Three, and the order they are mounted in is load-bearing.
 :class:`RequestIDMiddleware` is the outer one because it *clears* structlog's
 context vars on entry; anything bound outside it would be wiped before a single
 handler ran. :class:`TelemetryMiddleware` sits just inside, which is what lets
@@ -15,18 +15,24 @@ through a second task, which breaks streaming responses and adds a hop to every
 request. It matters twice over here, because the ASGI boundary is the only
 place that can see a response's *first body message* leave, and that is the
 only honest definition of time to first token.
+
+:class:`BodyLimitMiddleware` is the innermost, so a ``413`` it sends still
+carries the request ID, is logged and is counted like any other response.
 """
 
 import time
+from collections import deque
 from typing import Final
 from uuid import uuid4
 
 import structlog
 from starlette.datastructures import Headers, MutableHeaders
+from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from vortex_ai_gateway import metrics, tracing
 from vortex_ai_gateway.cache import CACHE_HEADER
+from vortex_ai_gateway.contracts import ErrorDetail
 from vortex_ai_gateway.semantic import SEMANTIC_HEADER, SEMANTIC_SCORE_HEADER
 
 REQUEST_ID_HEADER = "x-request-id"
@@ -322,3 +328,69 @@ def _describe(
         span.set_attribute("vortex.semantic_cache.score", float(semantic_score))
     if status_code >= 500:
         span.set_status(tracing.StatusCode.ERROR, f"HTTP {status_code}")
+
+
+class BodyLimitMiddleware:
+    """Refuse a request body larger than ``max_bytes`` with a ``413`` (ADR-034).
+
+    FastAPI reads and holds the whole body before any dependency runs — before
+    the API key is checked (ADR-013) — so without this, anyone who can reach
+    the port decides how much memory a worker holds.
+
+    Two checks, because a body can arrive two ways. A declared
+    ``Content-Length`` over the limit is refused before a byte is read. A
+    chunked body has no length to declare, so it is read here, counted as it
+    arrives, and refused the moment it passes the limit; one that fits is
+    replayed to the app exactly as it arrived. The app buffers the body
+    anyway, so holding it here first costs nothing it was not already paying.
+
+    The refusal is sent from here rather than raised: an exception from
+    ``receive`` reaches FastAPI's body parser, which turns anything it does not
+    recognise into a generic ``400``.
+    """
+
+    def __init__(self, app: ASGIApp, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        declared = Headers(scope=scope).get("content-length", "")
+        if declared.isdigit() and int(declared) > self.max_bytes:
+            await self._refuse(scope, receive, send)
+            return
+
+        # Every message is kept as it arrived, a disconnect included, so the
+        # app sees exactly the stream it would have seen without this layer.
+        pending: deque[Message] = deque()
+        received = 0
+        while True:
+            message = await receive()
+            pending.append(message)
+            if message["type"] != "http.request":
+                break
+            received += len(message.get("body", b""))
+            if received > self.max_bytes:
+                await self._refuse(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
+
+        async def replay() -> Message:
+            # After the body, the real `receive`: a streaming response listens
+            # on it for the client hanging up (ADR-019).
+            return pending.popleft() if pending else await receive()
+
+        await self.app(scope, replay, send)
+
+    async def _refuse(self, scope: Scope, receive: Receive, send: Send) -> None:
+        detail = ErrorDetail(
+            message=f"The request body is larger than the {self.max_bytes}-byte limit.",
+            type="invalid_request_error",
+            code="request_body_too_large",
+        )
+        response = JSONResponse(status_code=413, content={"error": detail.model_dump(mode="json")})
+        await response(scope, receive, send)

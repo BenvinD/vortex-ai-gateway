@@ -933,6 +933,7 @@ JSON, because JSON is a hostile format to type into a deployment console.
 | `VORTEX_REDIS_CONNECT_TIMEOUT_SECONDS` | `0.5` | budget for connecting to Redis |
 | `VORTEX_REQUEST_TIMEOUT_SECONDS` | `30` | budget for a provider's *answer* |
 | `VORTEX_CONNECT_TIMEOUT_SECONDS` | `5` | budget for the connection itself; separate so an unreachable host cannot hold a worker for 30 s |
+| `VORTEX_MAX_REQUEST_BODY_BYTES` | `10485760` (10 MiB) | larger bodies are a `413` before the key is checked; raise it for image-heavy traffic (ADR-034) |
 
 **Client keys** ([API keys](#api-keys), ADR-003)
 
