@@ -12,14 +12,17 @@ implementations that hold other providers, which is the same seam
   when a failure means *this provider* cannot serve the request — never when it
   means nobody can (ADR-020).
 
-Streaming is forwarded untouched by both. Once a chunk is on the wire the
-``200`` is committed, so a mid-stream retry or hop would splice two
-generations into one response; establishing-phase retries are worth doing and
-are not done here yet.
+A stream gets the same retries, breaker and hops as a completion, but only up
+to its first chunk (ADR-032). Until then nothing has been sent, and the route
+holds the ``200`` until it has that chunk in hand; after it, a retry or a hop
+would splice two generations into one response, so the rest is relayed
+untouched. Both classes run one loop for both shapes, generic over what a
+single attempt is: awaiting a completion, or opening a stream and awaiting its
+first chunk.
 """
 
 import asyncio
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from typing import Final
 
 import structlog
@@ -39,6 +42,7 @@ from vortex_ai_gateway.metrics import (
 from vortex_ai_gateway.providers.base import ChatProvider
 from vortex_ai_gateway.providers.errors import CircuitOpenError, ProviderError
 from vortex_ai_gateway.resilience import CircuitBreaker, RetryBudget, RetryPolicy, now
+from vortex_ai_gateway.streaming import aclose_stream
 from vortex_ai_gateway.tracing import span
 
 logger = structlog.get_logger(__name__)
@@ -50,14 +54,17 @@ GIVE_UP_EVENT: Final = "provider call failed after retries"
 FALLBACK_EVENT: Final = "provider fallback"
 
 #: Why a retry sequence stopped, as the ``reason`` label on
-#: ``vortex_provider_give_ups_total``. A closed set, so the three ways to give
+#: ``vortex_provider_give_ups_total``. A closed set, so the four ways to give
 #: up stay distinguishable on a graph: running out of attempts is a provider
 #: problem, running out of budget is a *fleet* problem and means the outage is
-#: wider than this request, and running out of deadline means the retries were
-#: never going to finish in time and the policy is mistuned (ADR-001).
+#: wider than this request, running out of deadline means the retries were
+#: never going to finish in time and the policy is mistuned (ADR-001), and a
+#: failed trial is the breaker's probe finding the provider still down — one
+#: call by design, not a sequence cut short (ADR-030).
 GAVE_UP_EXHAUSTED: Final = "attempts exhausted"
 GAVE_UP_BUDGET: Final = "retry budget exhausted"
 GAVE_UP_DEADLINE: Final = "deadline reached"
+GAVE_UP_TRIAL: Final = "half-open trial failed"
 
 
 def _retry_after_of(exc: ProviderError) -> float | None:
@@ -69,6 +76,31 @@ def _retry_after_of(exc: ProviderError) -> float | None:
     """
     value = getattr(exc, "retry_after", None)
     return float(value) if isinstance(value, int | float) else None
+
+
+#: A stream that has started, and the first chunk it produced — ``None`` for a
+#: stream that ended without producing any.
+type Opened = tuple[AsyncIterator[ChatCompletionChunk], ChatCompletionChunk | None]
+
+
+async def _open(stream: AsyncIterator[ChatCompletionChunk]) -> Opened:
+    """Await ``stream``'s first chunk: one attempt, for a stream (ADR-032).
+
+    An adapter's stream makes its HTTP request when it is first iterated, so
+    this is where a refused key, an unknown model, a ``429`` or a ``5xx``
+    surfaces — while nothing has been sent, and the failure can still be
+    retried, hopped or turned into a status code. A stream that fails here is
+    closed before the failure propagates, so a retry never leaves the attempt
+    before it holding a connection.
+    """
+    try:
+        first = await anext(stream)
+    except StopAsyncIteration:
+        return stream, None
+    except BaseException:
+        await aclose_stream(stream)
+        raise
+    return stream, first
 
 
 class ResilientProvider:
@@ -101,14 +133,45 @@ class ResilientProvider:
 
     async def complete(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         """Serve ``request``, retrying transient failures within the deadline."""
+        return await self._call(request, lambda: self.inner.complete(request))
+
+    async def stream(self, request: ChatCompletionRequest) -> AsyncIterator[ChatCompletionChunk]:
+        """Stream ``request``, retried as :meth:`complete` is until its first chunk.
+
+        The first chunk is the breaker's verdict: it arriving is a success, and
+        a failure after it moves nothing, because the upstream has demonstrably
+        answered. The rest is relayed untouched, and the inner stream is closed
+        in a ``finally`` so a client hanging up still reaches the adapter and
+        closes the upstream connection (ADR-019).
+        """
+        stream, first = await self._call(request, lambda: _open(self.inner.stream(request)))
+        try:
+            if first is not None:
+                yield first
+            async for chunk in stream:
+                yield chunk
+        finally:
+            await aclose_stream(stream)
+
+    async def _call[T](
+        self, request: ChatCompletionRequest, attempt_once: Callable[[], Awaitable[T]]
+    ) -> T:
+        """Run ``attempt_once`` under the retry policy and this provider's breaker.
+
+        One loop for both shapes of request, so the rules it took ADR-030 to
+        get right — the permit, the one-call trial, the slot handed back in a
+        ``finally``, the single give-up report — cannot drift between them.
+        """
         started = now()
         deadline = self.policy.deadline_seconds
         last_exc: ProviderError | None = None
+        gave_up: str | None = None
 
         for attempt in range(self.policy.max_attempts):
             # Consulted before *every* attempt, not once per request: when the
             # breaker opens mid-sequence the remaining attempts must stop.
-            if not await self.breaker.allow():
+            permit = await self.breaker.allow()
+            if permit is None:
                 raise await self._refuse()
 
             try:
@@ -123,12 +186,11 @@ class ResilientProvider:
                         "vortex.max_attempts": self.policy.max_attempts,
                     },
                 ):
-                    completion = await self.inner.complete(request)
+                    result = await attempt_once()
             except asyncio.CancelledError:
-                # The caller went away. Hand back a half-open trial slot without
-                # blaming the upstream, then let the cancellation carry on.
+                # The caller went away. Nothing was learned about the upstream;
+                # the `finally` below hands back a trial slot if this held one.
                 PROVIDER_ATTEMPTS.labels(provider=self.name, outcome="cancelled").inc()
-                await self.breaker.release_trial()
                 raise
             except ProviderError as exc:
                 # Counted before the retryable check, because the point of this
@@ -141,50 +203,76 @@ class ResilientProvider:
                     # cannot read. None of these say the provider is unhealthy,
                     # so none of them may move the breaker.
                     raise
+                if permit.trial:
+                    # The half-open trial is one call, never a retry sequence
+                    # (ADR-030): its own next `allow()` would be refused by its
+                    # own reservation, and sleeping through a backoff on the
+                    # only slot refuses every other caller too. Reopen now.
+                    await self.breaker.record_failure()
+                    self._report_give_up(request, exc, GAVE_UP_TRIAL, attempts=attempt + 1)
+                    raise
                 last_exc = exc
-                if not await self._should_retry(exc, attempt, started, deadline):
+                gave_up = await self._backoff_or_give_up(exc, attempt, started, deadline)
+                if gave_up is not None:
                     break
             else:
                 PROVIDER_ATTEMPTS.labels(provider=self.name, outcome="ok").inc()
                 await self.breaker.record_success()
-                return completion
+                return result
+            finally:
+                # Every exit above that recorded no verdict — a non-retryable
+                # failure, a cancellation, an exception that is not a
+                # `ProviderError` — must hand a trial slot back, or the breaker
+                # sits in HALF_OPEN refusing everyone forever (ADR-030). It
+                # releases nothing for any other permit, or after a verdict.
+                await self.breaker.release_trial(permit)
 
         await self.breaker.record_failure()
-        if last_exc is None:  # pragma: no cover - defensive; the loop always sets it
+        if last_exc is None or gave_up is None:  # pragma: no cover - the loop sets both
             raise CircuitOpenError(f"{self.name} exhausted its retries", provider=self.name)
+        self._report_give_up(request, last_exc, gave_up, attempts=attempt + 1)
+        raise last_exc
+
+    def _report_give_up(
+        self, request: ChatCompletionRequest, exc: ProviderError, reason: str, *, attempts: int
+    ) -> None:
+        """Write the one log line and the one count a request that gave up gets.
+
+        One place, so one give-up is one event: the line used to be written
+        here *and* by whatever decided to stop, and the counter incremented
+        under both reasons, so a budget give-up read as two on the dashboard.
+        """
         logger.warning(
             GIVE_UP_EVENT,
             provider=self.name,
             model=request.model,
-            attempts=self.policy.max_attempts,
-            error=type(last_exc).__name__,
-            code=last_exc.code,
+            reason=reason,
+            attempts=attempts,
+            error=type(exc).__name__,
+            code=exc.code,
         )
-        PROVIDER_GIVE_UPS.labels(provider=self.name, reason=GAVE_UP_EXHAUSTED).inc()
-        raise last_exc
+        PROVIDER_GIVE_UPS.labels(provider=self.name, reason=reason).inc()
 
-    async def _should_retry(
+    async def _backoff_or_give_up(
         self,
         exc: ProviderError,
         attempt: int,
         started: float,
         deadline: float | None,
-    ) -> bool:
-        """Wait and report whether another attempt should follow this failure."""
+    ) -> str | None:
+        """Sleep out the backoff before another attempt, or say why there is none.
+
+        Returns ``None`` once it has waited, or the give-up reason without
+        reporting it: deciding and reporting are separate so that only
+        :meth:`_call` reports, exactly once.
+        """
         if attempt >= self.policy.max_attempts - 1:
-            return False
+            return GAVE_UP_EXHAUSTED
 
         # A budget protects the provider in aggregate; per-request attempt
         # counts cannot. Consumed only for retries, never the first call.
         if self.policy.budget is not None and not await self.policy.budget.consume():
-            logger.warning(
-                GIVE_UP_EVENT,
-                provider=self.name,
-                reason=GAVE_UP_BUDGET,
-                error=type(exc).__name__,
-            )
-            PROVIDER_GIVE_UPS.labels(provider=self.name, reason=GAVE_UP_BUDGET).inc()
-            return False
+            return GAVE_UP_BUDGET
 
         # The provider's own Retry-After beats our arithmetic: a policy that
         # substitutes its own backoff gets throttled again.
@@ -199,15 +287,7 @@ class ResilientProvider:
             if remaining <= 0 or sleep_for > remaining:
                 # Sleeping into a deadline we will miss wastes a worker and the
                 # client's patience both. Give up now and report the failure.
-                logger.warning(
-                    GIVE_UP_EVENT,
-                    provider=self.name,
-                    reason=GAVE_UP_DEADLINE,
-                    error=type(exc).__name__,
-                    remaining_s=round(max(0.0, remaining), 3),
-                )
-                PROVIDER_GIVE_UPS.labels(provider=self.name, reason=GAVE_UP_DEADLINE).inc()
-                return False
+                return GAVE_UP_DEADLINE
 
         logger.info(
             RETRY_EVENT,
@@ -225,11 +305,7 @@ class ResilientProvider:
         # report retries that never happened.
         PROVIDER_RETRIES.labels(provider=self.name, error=type(exc).__name__).inc()
         await asyncio.sleep(sleep_for)
-        return True
-
-    def stream(self, request: ChatCompletionRequest) -> AsyncIterator[ChatCompletionChunk]:
-        """Forward the stream untouched (see the module docstring)."""
-        return self.inner.stream(request)
+        return None
 
     async def aclose(self) -> None:
         """Close the wrapped provider, if it owns anything."""
@@ -267,10 +343,34 @@ class FallbackProvider:
 
     async def complete(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         """Serve ``request`` from the first provider in the chain that can."""
+        return await self._first_to_serve(request, lambda provider: provider.complete(request))
+
+    async def stream(self, request: ChatCompletionRequest) -> AsyncIterator[ChatCompletionChunk]:
+        """Stream from the first provider in the chain that produces a chunk.
+
+        A hop happens only before that chunk (ADR-032). After it, the ``200``
+        is committed and a hop would splice two providers' generations into one
+        body, so a mid-stream failure is the caller's, as an event.
+        """
+        stream, first = await self._first_to_serve(
+            request, lambda provider: _open(provider.stream(request))
+        )
+        try:
+            if first is not None:
+                yield first
+            async for chunk in stream:
+                yield chunk
+        finally:
+            await aclose_stream(stream)
+
+    async def _first_to_serve[T](
+        self, request: ChatCompletionRequest, attempt: Callable[[ChatProvider], Awaitable[T]]
+    ) -> T:
+        """Run ``attempt`` against each provider in turn until one succeeds."""
         last_exc: ProviderError | None = None
         for position, provider in enumerate(self.providers):
             try:
-                return await provider.complete(request)
+                return await attempt(provider)
             except ProviderError as exc:
                 if not self._is_hoppable(exc):
                     raise
@@ -292,10 +392,6 @@ class FallbackProvider:
         if last_exc is None:  # pragma: no cover - the loop cannot end without one
             raise ValueError("a fallback chain needs at least one provider")
         raise last_exc
-
-    def stream(self, request: ChatCompletionRequest) -> AsyncIterator[ChatCompletionChunk]:
-        """Stream from the head of the chain only (see the module docstring)."""
-        return self.providers[0].stream(request)
 
     async def aclose(self) -> None:
         """Close every provider in the chain."""

@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Callable
 
 import pytest
 
+from tests.test_streaming import EndlessProvider
 from tests.upstream import chat_request
 from vortex_ai_gateway import resilience
 from vortex_ai_gateway.config import Settings
@@ -39,30 +40,56 @@ from vortex_ai_gateway.routing import RoutingConfigError, build_router, parse_fa
 class ScriptedProvider:
     """A provider that replays a script of outcomes and counts its calls.
 
-    An entry that is an exception is raised; anything else is served by a real
-    :class:`MockProvider`, so a "success" is a genuinely well-formed response
-    rather than a sentinel the assertions have to special-case.
+    An entry that is an exception is raised — any ``BaseException``, so a
+    cancellation can be scripted like any other ending; anything else is served
+    by a real :class:`MockProvider`, so a "success" is a genuinely well-formed
+    response rather than a sentinel the assertions have to special-case.
     """
 
-    def __init__(self, *script: Exception | None, name: str = "primary") -> None:
+    def __init__(self, *script: BaseException | None, name: str = "primary") -> None:
         self.name = name
-        self._script: list[Exception | None] = list(script)
+        self._script: list[BaseException | None] = list(script)
         self._inner = MockProvider(name=name)
         self.calls = 0
 
-    def _next(self) -> Exception | None:
+    def _next(self) -> BaseException | None:
         outcome = self._script[min(self.calls, len(self._script) - 1)] if self._script else None
         self.calls += 1
         return outcome
 
     async def complete(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         outcome = self._next()
-        if isinstance(outcome, Exception):
+        if isinstance(outcome, BaseException):
             raise outcome
         return await self._inner.complete(request)
 
-    def stream(self, request: ChatCompletionRequest) -> AsyncIterator[ChatCompletionChunk]:
-        return self._inner.stream(request)
+    async def stream(self, request: ChatCompletionRequest) -> AsyncIterator[ChatCompletionChunk]:
+        """The same script, failing where an adapter does: before the first chunk."""
+        outcome = self._next()
+        if isinstance(outcome, BaseException):
+            raise outcome
+        async for chunk in self._inner.stream(request):
+            yield chunk
+
+
+class DiesMidStream:
+    """Streams one real chunk, then fails: the failure that must never be retried.
+
+    Once a chunk is on the wire the ``200`` is committed, and a retry would
+    splice a second generation onto the first (ADR-032).
+    """
+
+    def __init__(self, name: str = "primary") -> None:
+        self.name = name
+        self.calls = 0
+
+    async def complete(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
+        raise NotImplementedError("this provider only streams")
+
+    async def stream(self, request: ChatCompletionRequest) -> AsyncIterator[ChatCompletionChunk]:
+        self.calls += 1
+        yield await anext(MockProvider(name=self.name).stream(request))
+        raise ProviderUnavailable("connection reset mid-stream", provider=self.name)
 
 
 @pytest.fixture
@@ -250,16 +277,18 @@ async def test_the_breaker_probes_with_exactly_one_trial(clock: Callable[[float]
     breaker = CircuitBreaker(name="primary", failure_threshold=1, open_seconds=10.0)
     await breaker.record_failure()
     assert await breaker.state() is resilience.BreakerState.OPEN
-    assert await breaker.allow() is False
+    assert await breaker.allow() is None
 
     clock(10.0)
-    assert await breaker.allow() is True, "the first caller takes the trial"
-    assert await breaker.allow() is False, "everyone else still waits"
+    trial = await breaker.allow()
+    assert trial is not None and trial.trial, "the first caller takes the trial"
+    assert await breaker.allow() is None, "everyone else still waits"
     assert await breaker.state() is resilience.BreakerState.HALF_OPEN
 
     await breaker.record_success()
     assert await breaker.state() is resilience.BreakerState.CLOSED
-    assert await breaker.allow() is True
+    admitted = await breaker.allow()
+    assert admitted is not None and not admitted.trial
 
 
 async def test_a_failed_trial_reopens_the_breaker_for_longer(
@@ -301,27 +330,150 @@ async def test_the_open_window_stops_growing_at_the_cap(clock: Callable[[float],
     assert windows == [10.0, 50.0, 50.0, 50.0], "x10 would be 100s; the cap holds it at 50"
 
 
-async def test_a_cancelled_trial_hands_the_slot_back(clock: Callable[[float], None]) -> None:
-    """A client disconnect must not wedge the breaker in half-open forever."""
+@pytest.mark.parametrize(
+    ("ending", "state_after", "next_caller_admitted"),
+    [
+        (None, resilience.BreakerState.CLOSED, True),
+        (
+            ProviderUnavailable("still down", provider="primary"),
+            resilience.BreakerState.OPEN,
+            False,
+        ),
+        (
+            ProviderBadRequest("unknown model", provider="primary"),
+            resilience.BreakerState.HALF_OPEN,
+            True,
+        ),
+        (KeyError("adapter bug"), resilience.BreakerState.HALF_OPEN, True),
+        (asyncio.CancelledError(), resilience.BreakerState.HALF_OPEN, True),
+    ],
+    ids=["answers", "still-down", "callers-400", "adapter-bug", "cancelled"],
+)
+async def test_every_way_a_trial_ends_leaves_the_breaker_able_to_recover(
+    clock: Callable[[float], None],
+    sleeps: list[float],
+    ending: BaseException | None,
+    state_after: resilience.BreakerState,
+    next_caller_admitted: bool,
+) -> None:
+    """A trial slot nobody hands back wedges the breaker in half-open forever (ADR-030).
 
-    class Hangs:
+    Only cancellation used to hand it back. The two that learned something
+    move the breaker; the three that learned nothing free the slot for the
+    next caller and leave the breaker where it was.
+    """
+    inner = ScriptedProvider(ending)
+    breaker = CircuitBreaker(name="primary", failure_threshold=1, open_seconds=10.0)
+    wrapper = ResilientProvider(inner=inner, policy=policy(), breaker=breaker)
+    await breaker.record_failure()
+    clock(10.0)
+
+    if ending is None:
+        await wrapper.complete(chat_request())
+    else:
+        with pytest.raises(type(ending)):
+            await wrapper.complete(chat_request())
+
+    assert inner.calls == 1, "a trial is one call, however it ends"
+    assert await breaker.state() is state_after
+    assert (await breaker.allow() is not None) is next_caller_admitted
+
+
+async def test_a_trial_that_finds_the_provider_still_down_reopens_without_retrying(
+    clock: Callable[[float], None], sleeps: list[float]
+) -> None:
+    """The trial's own retry used to be refused by its own reservation, leaking the slot."""
+    inner = ScriptedProvider(ProviderUnavailable("still down", provider="primary"), None)
+    breaker = CircuitBreaker(name="primary", failure_threshold=1, open_seconds=10.0)
+    wrapper = ResilientProvider(inner=inner, policy=policy(max_attempts=3), breaker=breaker)
+    await breaker.record_failure()
+    clock(10.0)
+
+    # The real failure, not a 503 about the gateway's own breaker.
+    with pytest.raises(ProviderUnavailable):
+        await wrapper.complete(chat_request())
+
+    assert inner.calls == 1, "one call per window, even with attempts to spare"
+    assert sleeps == [], "no backoff slept while holding the only slot"
+    assert await breaker.retry_after_seconds() == 20.0, "reopened for the escalated window"
+
+    clock(20.0)
+    await wrapper.complete(chat_request())
+    assert await breaker.state() is resilience.BreakerState.CLOSED, "and it still recovers"
+
+
+async def test_only_the_permit_holding_the_trial_can_hand_it_back(
+    clock: Callable[[float], None],
+) -> None:
+    """A call admitted while closed must not free the slot of the trial running now."""
+    breaker = CircuitBreaker(name="primary", failure_threshold=1, open_seconds=10.0)
+    admitted_while_closed = await breaker.allow()
+    assert admitted_while_closed is not None and not admitted_while_closed.trial
+
+    await breaker.record_failure()
+    clock(10.0)
+    trial = await breaker.allow()
+    assert trial is not None and trial.trial
+
+    await breaker.release_trial(admitted_while_closed)
+    assert await breaker.allow() is None, "the slot is still the trial's"
+
+    await breaker.release_trial(trial)
+    assert await breaker.allow() is not None, "its owner can hand it back"
+
+
+async def test_a_trial_permit_from_an_earlier_cycle_releases_nothing(
+    clock: Callable[[float], None],
+) -> None:
+    """Ownership is by identity, so last window's trial cannot free this window's."""
+    breaker = CircuitBreaker(name="primary", failure_threshold=1, open_seconds=10.0)
+    await breaker.record_failure()
+    clock(10.0)
+    first = await breaker.allow()
+    assert first is not None
+    await breaker.record_failure()  # the first trial fails: reopened for 20s
+    clock(20.0)
+    second = await breaker.allow()
+    assert second is not None and second is not first
+
+    await breaker.release_trial(first)
+    assert await breaker.allow() is None, "the second trial's slot survived"
+
+
+async def test_a_call_from_before_the_outage_cannot_free_the_trials_slot(
+    clock: Callable[[float], None],
+) -> None:
+    """Hanging up during half-open, a long call admitted while closed hands back nothing."""
+    upstream_answers = asyncio.Event()
+
+    class Slow:
         name = "primary"
 
         async def complete(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
-            raise asyncio.CancelledError
+            await upstream_answers.wait()
+            return await MockProvider(name=self.name).complete(request)
 
         def stream(self, request: ChatCompletionRequest) -> AsyncIterator[ChatCompletionChunk]:
             raise NotImplementedError
 
     breaker = CircuitBreaker(name="primary", failure_threshold=1, open_seconds=10.0)
-    wrapper = ResilientProvider(inner=Hangs(), policy=policy(), breaker=breaker)
+    wrapper = ResilientProvider(inner=Slow(), policy=policy(max_attempts=1), breaker=breaker)
+
+    before_outage = asyncio.create_task(wrapper.complete(chat_request()))
+    await asyncio.sleep(0)  # admitted while closed, now waiting on the upstream
     await breaker.record_failure()
     clock(10.0)
+    trial = asyncio.create_task(wrapper.complete(chat_request()))
+    await asyncio.sleep(0)  # the trial holds the slot
 
+    before_outage.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await wrapper.complete(chat_request())
+        await before_outage
 
-    assert await breaker.allow() is True, "the trial slot was released, not leaked"
+    assert await breaker.allow() is None, "still one trial at a time"
+    upstream_answers.set()
+    await trial
+    assert await breaker.state() is resilience.BreakerState.CLOSED
 
 
 async def test_state_is_a_pure_read(clock: Callable[[float], None]) -> None:
@@ -330,7 +482,7 @@ async def test_state_is_a_pure_read(clock: Callable[[float], None]) -> None:
     clock(10.0)
     assert await breaker.state() is resilience.BreakerState.OPEN
     assert await breaker.state() is resilience.BreakerState.OPEN, "reading changed nothing"
-    assert await breaker.allow() is True, "only allow() takes the trial"
+    assert await breaker.allow() is not None, "only allow() takes the trial"
 
 
 # --- the fallback chain -----------------------------------------------------
@@ -381,8 +533,7 @@ def test_a_wrapper_names_the_provider_it_holds() -> None:
 # --- streaming and teardown -------------------------------------------------
 
 
-async def test_a_stream_is_forwarded_untouched_by_both_wrappers() -> None:
-    """Retrying a committed stream would splice two generations into one body."""
+async def test_a_healthy_stream_relays_every_chunk_through_both_wrappers() -> None:
     wrapper = resilient(ScriptedProvider())
     chunks = [chunk async for chunk in wrapper.stream(chat_request(stream=True))]
     assert chunks and chunks[-1].choices[0].finish_reason == "stop"
@@ -391,6 +542,144 @@ async def test_a_stream_is_forwarded_untouched_by_both_wrappers() -> None:
     from_chain = [chunk async for chunk in chain.stream(chat_request(stream=True))]
     assert from_chain[0].vortex is not None
     assert from_chain[0].vortex.provider == "primary", "the head of the chain streams"
+
+
+async def test_a_stream_is_retried_until_its_first_chunk(sleeps: list[float]) -> None:
+    """Nothing has been sent before the first chunk, so a retry splices nothing (ADR-032)."""
+    inner = ScriptedProvider(
+        ProviderUnavailable("upstream 503", provider="primary", status_code=503),
+        ProviderUnavailable("upstream 503", provider="primary", status_code=503),
+        None,
+    )
+    wrapper = resilient(inner)
+
+    chunks = [chunk async for chunk in wrapper.stream(chat_request(stream=True))]
+
+    assert inner.calls == 3
+    assert len(sleeps) == 2, "the same backoff a completion gets"
+    assert chunks and chunks[-1].choices[0].finish_reason == "stop", "only the third call's chunks"
+    assert await wrapper.breaker.state() is resilience.BreakerState.CLOSED
+
+
+async def test_a_stream_that_never_starts_trips_the_breaker_like_a_completion(
+    sleeps: list[float],
+) -> None:
+    """Streams used to bypass the breaker entirely; it never saw a dead upstream stream."""
+    inner = ScriptedProvider(ProviderUnavailable("down", provider="primary"))
+    breaker = CircuitBreaker(name="primary", failure_threshold=1, open_seconds=30.0)
+    wrapper = ResilientProvider(inner=inner, policy=policy(), breaker=breaker)
+
+    with pytest.raises(ProviderUnavailable):
+        await anext(wrapper.stream(chat_request(stream=True)))
+    assert inner.calls == 3
+
+    with pytest.raises(CircuitOpenError) as refused:
+        await anext(wrapper.stream(chat_request(stream=True)))
+    assert inner.calls == 3, "an open breaker refuses a stream before calling anyone"
+    assert refused.value.retry_after is not None
+
+
+async def test_a_stream_that_fails_after_its_first_chunk_is_never_retried(
+    sleeps: list[float],
+) -> None:
+    """The first chunk is the verdict: after it, the failure is the caller's, as is."""
+    inner = DiesMidStream()
+    breaker = CircuitBreaker(name="primary", failure_threshold=1, open_seconds=30.0)
+    wrapper = ResilientProvider(inner=inner, policy=policy(), breaker=breaker)
+    received: list[ChatCompletionChunk] = []
+
+    with pytest.raises(ProviderUnavailable, match="mid-stream"):
+        async for chunk in wrapper.stream(chat_request(stream=True)):
+            received.append(chunk)
+
+    assert inner.calls == 1, "a second call would splice two generations into one body"
+    assert len(received) == 1 and sleeps == []
+    assert await breaker.state() is resilience.BreakerState.CLOSED, (
+        "the upstream answered; a failure after the first chunk moves nothing"
+    )
+
+
+async def test_a_stream_that_ends_without_a_chunk_is_an_empty_success() -> None:
+    """The upstream answered, with nothing: not a failure to retry, and nothing to relay."""
+
+    class Empty:
+        name = "primary"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
+            raise NotImplementedError("this provider only streams")
+
+        async def stream(
+            self, request: ChatCompletionRequest
+        ) -> AsyncIterator[ChatCompletionChunk]:
+            self.calls += 1
+            return
+            yield  # unreachable; makes this a generator
+
+    inner = Empty()
+    breaker = CircuitBreaker(name="primary", failure_threshold=1)
+    wrapper = ResilientProvider(inner=inner, policy=policy(), breaker=breaker)
+
+    assert [chunk async for chunk in wrapper.stream(chat_request(stream=True))] == []
+    assert inner.calls == 1
+    assert await breaker.state() is resilience.BreakerState.CLOSED
+
+
+@pytest.mark.parametrize(
+    ("head", "served_by", "secondary_calls"),
+    [
+        (ScriptedProvider(ProviderUnavailable("down", provider="primary")), "secondary", 1),
+        (DiesMidStream(), None, 0),
+    ],
+    ids=["before-first-chunk", "after-first-chunk"],
+)
+async def test_a_stream_hops_before_its_first_chunk_and_never_after(
+    sleeps: list[float],
+    head: ScriptedProvider | DiesMidStream,
+    served_by: str | None,
+    secondary_calls: int,
+) -> None:
+    """A hop after the first chunk would splice two providers into one body (ADR-032)."""
+    secondary = ScriptedProvider(name="secondary")
+    chain = FallbackProvider([resilient(head), resilient(secondary)])  # type: ignore[arg-type]
+    received: list[ChatCompletionChunk] = []
+
+    try:
+        async for chunk in chain.stream(chat_request(stream=True)):
+            received.append(chunk)
+    except ProviderUnavailable:
+        assert served_by is None, "only the mid-stream failure reaches the caller"
+
+    assert secondary.calls == secondary_calls
+    if served_by is not None:
+        assert received[0].vortex is not None
+        assert received[0].vortex.provider == served_by
+
+
+@pytest.mark.parametrize("shape", ["resilient", "fallback"])
+async def test_closing_a_wrapped_stream_closes_the_adapter_at_once(shape: str) -> None:
+    """Closed by the wrapper's ``finally``, not whenever the garbage collector gets there.
+
+    When a client hangs up while the relay is suspended at a ``yield``, the
+    route closes the outermost stream. A wrapper that relays with ``async for …
+    yield`` and no ``finally`` drops the adapter's generator still suspended,
+    and asyncio only schedules its close on a later loop turn — an end-to-end
+    hang-up test cannot see the difference, so this asserts the moment
+    ``aclose()`` returns, before anything else has run.
+    """
+    endless = EndlessProvider()
+    wrapped = ResilientProvider(
+        inner=endless, policy=policy(), breaker=CircuitBreaker(name="endless")
+    )
+    provider = wrapped if shape == "resilient" else FallbackProvider([wrapped, MockProvider()])
+    stream = provider.stream(chat_request(stream=True))
+    await anext(stream)
+
+    await stream.aclose()  # type: ignore[attr-defined]
+
+    assert endless.closed, "the adapter was left suspended for the garbage collector"
 
 
 async def test_closing_reaches_every_adapter_exactly_once() -> None:

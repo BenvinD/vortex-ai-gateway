@@ -5,9 +5,14 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.test_resilience import DiesMidStream, ScriptedProvider, policy
 from vortex_ai_gateway.config import Settings
 from vortex_ai_gateway.gateway import create_app
 from vortex_ai_gateway.providers import CannedReply, MockProvider
+from vortex_ai_gateway.providers.errors import CircuitOpenError, ProviderUnavailable
+from vortex_ai_gateway.providers.resilience_wrapper import ResilientProvider
+from vortex_ai_gateway.resilience import CircuitBreaker
+from vortex_ai_gateway.routing import ProviderRouter, parse_routes
 
 CHAT_URL = "/v1/chat/completions"
 
@@ -122,21 +127,95 @@ def test_streamed_deltas_reassemble_into_the_reply() -> None:
     assert text == "streamed in pieces"
 
 
-def test_stream_failure_is_reported_as_a_final_error_event() -> None:
-    """The 200 is already sent, so the error has to arrive in-band."""
-    provider = MockProvider(replies=[RuntimeError("connection reset")])
-    client = TestClient(
-        create_app(settings=Settings(_env_file=None), provider=provider), headers=AUTH
+def serving(provider: object) -> TestClient:
+    """An app serving ``provider``, isolated from the ambient environment."""
+    return TestClient(
+        create_app(settings=Settings(_env_file=None), provider=provider),  # type: ignore[arg-type]
+        headers=AUTH,
+    )
+
+
+def test_a_stream_that_fails_before_its_first_chunk_is_a_status_code() -> None:
+    """Nothing has been sent yet, so the caller gets a status, not a 200 (ADR-032).
+
+    This was a 200 followed by an in-band error event: the route returned the
+    response before the adapter had made its HTTP request at all.
+    """
+    client = serving(MockProvider(replies=[RuntimeError("connection reset")]))
+
+    response = client.post(CHAT_URL, json=body(stream=True))
+
+    assert response.status_code == 502
+    error = response.json()["error"]
+    assert error["type"] == "api_error"
+    assert "connection reset" in error["message"]
+
+
+def test_a_stream_to_an_unknown_model_is_a_404() -> None:
+    """The router refuses before any provider is asked, so no 200 goes out (ADR-032).
+
+    This was an empty 200: the refusal surfaced only once the SSE body was
+    iterated, after the status line had been sent.
+    """
+    mock = MockProvider()
+    client = serving(ProviderRouter(routes=parse_routes("gpt-*=mock"), providers={"mock": mock}))
+
+    response = client.post(CHAT_URL, json=body(model="nobody-serves-this", stream=True))
+
+    assert response.status_code == 404
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "model_not_found"
+    assert mock.received_requests == []
+
+
+def test_a_stream_that_fails_after_its_first_chunk_ends_with_an_error_event() -> None:
+    """The 200 went out with the first chunk, so the error has to arrive in-band."""
+    client = serving(DiesMidStream())
+
+    with client.stream("POST", CHAT_URL, json=body(stream=True)) as response:
+        assert response.status_code == 200
+        events = [line for line in response.iter_lines() if line.startswith("data: ")]
+
+    assert len(events) == 3, "the first chunk, the error, the sentinel"
+    error = json.loads(events[-2].removeprefix("data: "))["error"]
+    assert error["type"] == "api_error"
+    assert "mid-stream" in error["message"]
+    assert events[-1] == "data: [DONE]"
+
+
+def test_a_stream_is_retried_before_its_200() -> None:
+    """The upstream's first failure never reaches the caller, as on the buffered path."""
+    flaky = ScriptedProvider(ProviderUnavailable("upstream 503", provider="primary"), None)
+    client = serving(
+        ResilientProvider(
+            inner=flaky, policy=policy(backoff_base=0.0), breaker=CircuitBreaker(name="primary")
+        )
     )
 
     with client.stream("POST", CHAT_URL, json=body(stream=True)) as response:
         assert response.status_code == 200
         events = [line for line in response.iter_lines() if line.startswith("data: ")]
 
-    error = json.loads(events[-2].removeprefix("data: "))["error"]
-    assert error["type"] == "api_error"
-    assert "connection reset" in error["message"]
+    assert flaky.calls == 2
     assert events[-1] == "data: [DONE]"
+    assert not any('"error"' in event for event in events)
+
+
+def test_a_stream_against_a_dead_upstream_is_a_502_and_then_a_503() -> None:
+    """Exhausted retries, then an open breaker: two statuses a client can act on."""
+    down = ScriptedProvider(ProviderUnavailable("down", provider="primary"))
+    breaker = CircuitBreaker(name="primary", failure_threshold=1, open_seconds=30.0)
+    client = serving(
+        ResilientProvider(inner=down, policy=policy(backoff_base=0.0), breaker=breaker)
+    )
+
+    first = client.post(CHAT_URL, json=body(stream=True))
+    second = client.post(CHAT_URL, json=body(stream=True))
+
+    assert (first.status_code, second.status_code) == (502, 503)
+    assert down.calls == 3, "the open breaker refused the second before anyone was called"
+    assert int(second.headers["retry-after"]) >= 1
 
 
 def test_app_defaults_to_the_mock_provider() -> None:
@@ -145,3 +224,18 @@ def test_app_defaults_to_the_mock_provider() -> None:
 
     assert isinstance(app.state.provider, MockProvider)
     assert TestClient(app, headers=AUTH).post(CHAT_URL, json=body()).status_code == 200
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(("wait", "header"), [(0.0, "1"), (0.4, "1"), (1.2, "2"), (30.0, "30")])
+def test_retry_after_on_a_refusal_rounds_up_and_is_never_zero(
+    stream: bool, wait: float, header: str
+) -> None:
+    """A sub-second breaker wait used to truncate to `Retry-After: 0`."""
+    refused = CircuitOpenError("open", provider="primary", retry_after=wait)
+    client = serving(MockProvider(replies=[refused]))
+
+    response = client.post(CHAT_URL, json=body(stream=stream))
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == header

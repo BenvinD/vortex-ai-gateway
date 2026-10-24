@@ -25,7 +25,7 @@ flowchart TD
 
     subgraph selection["Selection — the ChatProvider seam, all the way down"]
         router["<b>ProviderRouter</b><br/>ordered pattern=provider globs, first match wins<br/><i>ADR-016 · ADR-017</i>"]
-        resilience["<b>ResilientProvider / FallbackProvider</b><br/>retry on retryable · breaker per provider · ordered chain<br/><i>ADR-001 · ADR-002 · ADR-020</i>"]
+        resilience["<b>ResilientProvider / FallbackProvider</b><br/>retry on retryable · breaker per provider · ordered chain<br/><i>ADR-001 · ADR-002 · ADR-020 · ADR-030</i>"]
         adapter["<b>Vendor adapter</b><br/>translates both ways · refuses what it cannot express<br/><i>ADR-011 · ADR-014 · ADR-015</i>"]
     end
 
@@ -54,10 +54,12 @@ flowchart TD
     class redis,settle store
 ```
 
-A streaming request takes the same path with two differences: the cache reports
-`BYPASS` without looking (ADR-004), and settlement moves into the SSE
-generator's `finally`, because a stream's cost is only known once it has ended —
-and it has three endings (ADR-019).
+A streaming request takes the same path with three differences: the cache
+reports `BYPASS` without looking (ADR-004); the `200` waits for the stream's
+first chunk, which the wrappers retry and hop for exactly as they do a
+completion (ADR-032); and settlement moves into the SSE generator's `finally`,
+because a stream's cost is only known once it has ended — and it has three
+endings (ADR-019).
 
 ## Box by box
 
@@ -118,7 +120,7 @@ and surfaces as a quality complaint weeks later.
 replacement); the intersection of all three vendors (loses — the intersection
 has no tool calling, which is most of the value).
 
-### 4. `Meter.admit` — ADR-021
+### 4. `Meter.admit` — ADR-021, ADR-031
 
 **Does.** Reserves one request and an estimated token count against the caller's
 per-minute buckets, in a single Lua script, before anything upstream is touched.
@@ -131,6 +133,10 @@ limit across the minute boundary. TPM is a limit on a number that does not exist
 yet, so admission reserves a deliberately crude estimate and settlement
 reconciles it — which makes the estimate's *accuracy* nearly irrelevant, since
 it governs what a caller may have in flight rather than what they are charged.
+One exception: a bucket never holds more than its capacity, so an estimate
+above the whole TPM allowance could wait forever and not fit. That is a `400`
+decided from the key before Redis is asked, not a `429` whose `Retry-After`
+could never come true (ADR-031).
 Headers on success as well as rejection, because a client that only learns its
 remaining allowance by exceeding it can only back off after being throttled.
 
@@ -190,7 +196,7 @@ per-replica file gives every replica its own private routing table. When runtime
 mutation is genuinely needed here the store is Redis, and it is a change to
 `build_router` alone.
 
-### 7. `ResilientProvider` / `FallbackProvider` — ADR-001, ADR-002, ADR-020
+### 7. `ResilientProvider` / `FallbackProvider` — ADR-001, ADR-002, ADR-020, ADR-030, ADR-032
 
 **Does.** Wraps every adapter, before the router ever sees it, in its own retry
 loop and its own circuit breaker; `FallbackProvider` tries an ordered chain.
@@ -208,9 +214,16 @@ breaker would let a dead OpenAI refuse Anthropic traffic, which is the opposite
 of what a multi-provider gateway is for; failures are counted per request, not
 per attempt, so the threshold means what it says; a `ProviderBadRequest` never
 moves it, or one client sending garbage could take a provider offline for
-everyone. Fallback hops only on `CircuitOpenError` or exhausted retries — never
-on a `400`, which would fail everywhere and spend a second provider's quota to
-return the same error more slowly.
+everyone. The half-open trial is one call, and its slot has an owner:
+`allow()` returns a `Permit`, and every attempt hands a trial slot back in a
+`finally` unless a verdict was recorded — a slot nobody returns leaves the
+breaker refusing everyone with no clock running. Fallback hops only on
+`CircuitOpenError` or exhausted retries — never on a `400`, which would fail
+everywhere and spend a second provider's quota to return the same error more
+slowly. A stream runs the same loops, generic over what one attempt is, up to
+its first chunk: that chunk is the breaker's verdict, and nothing after it is
+retried or hopped, because a second attempt would splice two generations into
+one body.
 
 **Rejected.** Automatic failover on any error. Also deliberately not built:
 per-hop model rewriting, which needs syntax; and `UnsupportedParameterError` is
@@ -276,7 +289,7 @@ price). Storing both wins the day prices must be frozen per request for audit.
 | State | Home | Lifetime | Shared across workers |
 |---|---|---|---|
 | API keys | SQLite, hashed | until revoked | one file, one node |
-| Rate-limit buckets | Redis `vortex:rl:<key_id>:{requests,tokens}` | 2 minutes idle | yes |
+| Rate-limit buckets | Redis `vortex:rl:{<key_id>}:requests` and `…:tokens`; the braces are a Cluster hash tag, so both land in one slot | 2 minutes idle | yes |
 | Usage ledger | Redis `vortex:usage:<key_id>:<YYYY-MM-DD>` | `VORTEX_USAGE_RETENTION_DAYS` | yes |
 | Cache entries | Redis `vortex:cache:<scope>:<path>:<sha256>` | per-route TTL | yes |
 | Breaker state | process memory | process | **no** |
@@ -293,7 +306,7 @@ down.
 | Ending | Buffered | Streamed |
 |---|---|---|
 | Success | `200` + envelope, settled with real usage | chunks, `[DONE]`, settled in the generator's `finally` |
-| Provider failure | `502`/`504`/`429`… + error envelope, reservation released in full | the `200` is already on the wire, so the error is one final SSE event before `[DONE]` |
+| Provider failure | `502`/`504`/`429`… + error envelope, reservation released in full | before the first chunk — after the same retries and hops — it is the buffered row exactly, because the `200` waits for that chunk (ADR-032); after it the `200` is on the wire, so the error is one final SSE event before `[DONE]` |
 | Client hangs up | nothing to do | cancellation is recorded, re-raised into the provider's generator to close the upstream, and settled as *unmetered* on a spawned task — because the scope is already cancelled and awaiting Redis there loses precisely the settlement that matters (ADR-019) |
 
 ## Reading order

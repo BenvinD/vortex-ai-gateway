@@ -10,7 +10,8 @@ Three pieces, deliberately small and separately testable:
   (ADR-001).
 * :class:`CircuitBreaker` — a three-state breaker, one per provider, that stops
   calling an upstream that is failing and probes it with a single trial before
-  letting traffic back (ADR-002).
+  letting traffic back (ADR-002). Admission is a :class:`Permit`, so the trial
+  slot has an owner (ADR-030).
 
 Nothing here knows what a provider is. The wiring lives in
 :mod:`vortex_ai_gateway.providers.resilience_wrapper`, which is what makes
@@ -133,6 +134,26 @@ class BreakerState(Enum):
         return {"closed": 0, "half_open": 1, "open": 2}[self.value]
 
 
+@dataclass(frozen=True, eq=False, slots=True)
+class Permit:
+    """Leave from :meth:`CircuitBreaker.allow` to make one call.
+
+    ``trial`` says whether this call is the half-open probe, which the retry
+    loop needs because a trial is one call, never a retry sequence (ADR-030).
+
+    ``eq=False`` is load-bearing: the breaker recognises the permit holding its
+    trial slot by *identity*, so a call admitted while the breaker was closed
+    can never hand back a slot that some other call is holding.
+    """
+
+    trial: bool = False
+
+
+#: One permit shared by every call admitted while closed. Only a trial permit
+#: is ever compared by identity, so these need not be distinct.
+_ADMITTED: Final = Permit()
+
+
 class CircuitBreaker:
     """One provider's breaker: stop calling something that is failing.
 
@@ -144,10 +165,11 @@ class CircuitBreaker:
       a trial. Success closes the breaker; failure reopens it for longer.
 
     The single-trial rule is what makes recovery a trickle rather than the
-    whole herd arriving at once. The trial slot is reserved by :meth:`allow`
-    and must always be handed back — via :meth:`record_success`,
-    :meth:`record_failure` or :meth:`release_trial` — or the breaker would sit
-    in ``HALF_OPEN`` refusing everything forever.
+    whole herd arriving at once. The trial slot is reserved by :meth:`allow`,
+    which hands back the :class:`Permit` that owns it, and must always be
+    handed back — via :meth:`record_success`, :meth:`record_failure` or
+    :meth:`release_trial` — or the breaker would sit in ``HALF_OPEN`` refusing
+    everything forever (ADR-030).
     """
 
     def __init__(
@@ -169,7 +191,8 @@ class CircuitBreaker:
         self._state = BreakerState.CLOSED
         self._consecutive_failures = 0
         self._opened_until: float | None = None
-        self._half_open_in_use = False
+        #: The permit holding the half-open trial slot, or ``None`` when free.
+        self._trial: Permit | None = None
         self._lock = asyncio.Lock()
 
     def __repr__(self) -> str:
@@ -210,24 +233,28 @@ class CircuitBreaker:
             self._open_seconds * self.backoff_multiplier, self.max_open_seconds
         )
 
-    async def allow(self) -> bool:
-        """Whether a call may proceed now, reserving the trial slot if needed."""
+    async def allow(self) -> Permit | None:
+        """Leave to make one call now, or ``None`` while the breaker refuses.
+
+        When the call is the half-open trial, the permit returned is the one
+        that owns the trial slot, and :attr:`Permit.trial` says so.
+        """
         async with self._lock:
             if self._state is BreakerState.CLOSED:
-                return True
+                return _ADMITTED
 
             if self._state is BreakerState.OPEN:
                 if self._opened_until is not None and now() >= self._opened_until:
                     self._transition(BreakerState.HALF_OPEN, open_window_elapsed=True)
-                    self._half_open_in_use = True
-                    return True
-                return False
+                    self._trial = Permit(trial=True)
+                    return self._trial
+                return None
 
             # HALF_OPEN: admit one trial, refuse everyone else until it reports.
-            if not self._half_open_in_use:
-                self._half_open_in_use = True
-                return True
-            return False
+            if self._trial is None:
+                self._trial = Permit(trial=True)
+                return self._trial
+            return None
 
     async def record_success(self) -> None:
         """A call succeeded: close the breaker and reset the open window."""
@@ -236,15 +263,15 @@ class CircuitBreaker:
             self._consecutive_failures = 0
             self._opened_until = None
             self._open_seconds = self._base_open_seconds
-            self._half_open_in_use = False
+            self._trial = None
 
     async def record_failure(self) -> None:
-        """A request failed after exhausting its retries."""
+        """A request failed: it exhausted its retries, or it was the trial."""
         async with self._lock:
             self._consecutive_failures += 1
             if self._state is BreakerState.HALF_OPEN:
                 # The trial failed: straight back to open, for longer.
-                self._half_open_in_use = False
+                self._trial = None
                 self._open()
                 return
             if (
@@ -253,15 +280,23 @@ class CircuitBreaker:
             ):
                 self._open()
 
-    async def release_trial(self) -> None:
+    async def release_trial(self, permit: Permit) -> None:
         """Hand back the trial slot without judging the provider.
 
-        For the case where the trial caller went away — a client disconnect
-        cancels the task mid-call — so the slot must not be leaked, but nothing
-        was learned about the upstream either.
+        For every way a trial can end having learned nothing about the
+        upstream: the caller went away, the request was the caller's own
+        mistake, or something that is not a provider failure was raised
+        (ADR-030). The slot must not be leaked, and no verdict is recorded.
+
+        A no-op unless ``permit`` is the one holding the slot, so it is safe on
+        every exit path: a permit from a closed breaker, or one whose verdict
+        was already recorded, releases nothing. It never suspends — no breaker
+        method holds the lock across an ``await`` — so it completes even inside
+        a scope that has already been cancelled.
         """
         async with self._lock:
-            self._half_open_in_use = False
+            if self._trial is permit:
+                self._trial = None
 
     async def state(self) -> BreakerState:
         """The current state. A pure read: it changes nothing."""

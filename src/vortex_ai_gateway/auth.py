@@ -20,9 +20,13 @@ active:
 
 They are not merged. Two allow-lists means revoking a key from one and still
 being let in by the other.
+
+Development mode is refused at startup in staging and prod (ADR-035): there it
+is not a convenience but an open proxy to paid providers.
 """
 
 from dataclasses import dataclass
+from typing import Final
 
 import structlog
 from fastapi import Request
@@ -34,6 +38,38 @@ from vortex_ai_gateway.keys import ApiKeyRecord, KeyStore, fingerprint, parse_ke
 logger = structlog.get_logger(__name__)
 
 BEARER_PREFIX = "Bearer "
+
+#: Environments that may not run in development mode. Staging as well as prod,
+#: because a staging gateway holds real provider credentials too, and an open
+#: one spends them for anyone who finds it (ADR-035).
+GUARDED_ENVIRONMENTS: Final = frozenset({"staging", "prod"})
+
+
+class OpenGatewayError(ValueError):
+    """A guarded environment was configured with no source of keys.
+
+    Raised by the app factory, before anything else is built, for the reason
+    :class:`~vortex_ai_gateway.routing.RoutingConfigError` is: a gateway that
+    boots open is only found out by whoever finds it first.
+    """
+
+
+def ensure_key_source(settings: Settings) -> None:
+    """Refuse development mode in a guarded environment.
+
+    Checked in ``create_app`` rather than as a ``Settings`` validator, because
+    ``vortex-keys`` builds ``Settings`` too, and it is the tool that fixes this.
+    """
+    if settings.environment not in GUARDED_ENVIRONMENTS:
+        return
+    if settings.key_db_path or settings.allowed_api_keys:
+        return
+    raise OpenGatewayError(
+        f"VORTEX_ENVIRONMENT={settings.environment} with neither VORTEX_KEY_DB_PATH nor "
+        "VORTEX_API_KEYS set would accept any well-formed key. Configure a key source, "
+        "or run with VORTEX_ENVIRONMENT=dev to accept that on purpose."
+    )
+
 
 #: Logged whenever a well-formed key is turned away, so a caller reporting "it
 #: stopped working" can be answered from the gateway's own records.

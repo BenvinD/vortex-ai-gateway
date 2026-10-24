@@ -23,3 +23,5 @@ to the same model names — OpenAI-compatible endpoints, or aliased deployments.
 Per-hop model rewriting is the obvious next step and is deliberately not built:
 it needs syntax, and this needed shipping. Streams do not fall back, for the
 same reason they do not retry.
+Update (2026-10-18): streams now hop exactly where they now retry — before
+their first chunk, when nothing has been sent — and never after it (ADR-032).

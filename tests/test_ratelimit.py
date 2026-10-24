@@ -15,11 +15,13 @@ from collections.abc import Callable
 
 import pytest
 from fakeredis import aioredis
+from redis.crc import key_slot
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from vortex_ai_gateway.auth import Principal
 from vortex_ai_gateway.config import Settings
 from vortex_ai_gateway.contracts import ChatCompletionRequest
+from vortex_ai_gateway.keys import fingerprint
 from vortex_ai_gateway.ratelimit import (
     BucketState,
     Decision,
@@ -233,11 +235,11 @@ async def test_reconciling_an_exact_estimate_touches_nothing(
 ) -> None:
     principal = caller(tpm=1_000)
     await limiter.admit(principal, tokens=100)
-    before = await redis.hgetall("vortex:rl:k-1:tokens")
+    before = await redis.hgetall("vortex:rl:{k-1}:tokens")
 
     await limiter.reconcile(principal, reserved=100, actual=100)
 
-    assert await redis.hgetall("vortex:rl:k-1:tokens") == before
+    assert await redis.hgetall("vortex:rl:{k-1}:tokens") == before
 
 
 # --- Redis being down --------------------------------------------------------
@@ -355,7 +357,9 @@ async def test_two_hundred_concurrent_requests_never_over_admit(
     assert all(decision.headers()["retry-after"] for decision in decisions if not decision.allowed)
     # And the bucket agrees with the count of admissions, rather than merely
     # having stopped somewhere near it.
-    assert float((await redis.hget("vortex:rl:k-1:requests", "tokens")) or 1) == pytest.approx(0.0)
+    assert float((await redis.hget("vortex:rl:{k-1}:requests", "tokens")) or 1) == pytest.approx(
+        0.0
+    )
 
 
 async def test_concurrent_token_spend_never_over_admits(limiter: RateLimiter) -> None:
@@ -390,3 +394,13 @@ def test_a_message_with_no_content_contributes_nothing() -> None:
     )
 
     assert estimate_tokens(request, settings) == 1 + 3
+
+
+@pytest.mark.parametrize("key_id", [fingerprint("sk-plain"), "0123456789abcdef"])
+def test_both_buckets_of_a_key_share_one_cluster_slot(key_id: str) -> None:
+    """The admit script reads and writes both; Cluster refuses keys across slots."""
+    limiter = RateLimiter(aioredis.FakeRedis())
+
+    slots = {key_slot(key.encode()) for key in limiter._keys(key_id)}
+
+    assert len(slots) == 1

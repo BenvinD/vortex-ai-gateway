@@ -40,6 +40,15 @@ class Settings(BaseSettings):
     # Redis backs rate limiting and load balancing (see the pyproject scope).
     redis_url: str = "redis://localhost:6379/0"
 
+    # Budgets for one Redis call, in seconds. Every Redis consumer fails open,
+    # but failing open only helps a request if the failure arrives: with no
+    # timeout, a Redis that accepts the connection and never answers hangs every
+    # request forever. Short, because one request makes about five Redis calls
+    # in sequence and each spends the whole budget while Redis is sick, and a
+    # healthy Redis answers in about a millisecond (ADR-033).
+    redis_socket_timeout_seconds: float = 0.25
+    redis_connect_timeout_seconds: float = 0.5
+
     # How long to wait for an upstream provider's *answer*, in seconds. Long,
     # because generating tokens is slow.
     request_timeout_seconds: float = 30.0
@@ -50,6 +59,12 @@ class Settings(BaseSettings):
     # unroutable IP pins a worker for the whole generation window
     # (docs/notes/day-04.md).
     connect_timeout_seconds: float = 5.0
+
+    # The largest request body accepted, in bytes; anything larger is a `413`
+    # before the API key is checked. A 128k-token prompt is about half a
+    # megabyte of text, so the default is room for a few inline base64 images
+    # on top. Raise it for image-heavy traffic (ADR-034).
+    max_request_body_bytes: Annotated[int, Field(ge=1)] = 10 * 1024 * 1024
 
     # Client API keys accepted at the edge, comma-separated. Kept as a plain
     # string rather than a set because pydantic-settings parses collection

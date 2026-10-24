@@ -56,7 +56,9 @@ translating that contract to and from its own format. `routing.py` maps model
 names onto providers from config and is itself a `ChatProvider`, so `create_app`
 mounts a router exactly where it would mount one adapter; with no routing table
 configured it falls back to the mock. `routes.py` owns the HTTP surface and the
-only place a provider failure becomes a status code. `streaming.py` owns what a
+only place a provider failure becomes a status code — a stream's too, because
+the route holds the `200` until the stream's first chunk is in hand (ADR-032).
+`streaming.py` owns what a
 stream *costs*: it asks every provider for usage regardless of what the caller
 requested, strips the usage chunk back out when the caller did not ask
 (ADR-018), and writes one `stream finished` record per streamed request —
@@ -69,7 +71,12 @@ them through the `ChatProvider` seam: `ResilientProvider` wraps one adapter with
 retries and a breaker of its own, `FallbackProvider` tries an ordered chain.
 `build_router` wraps every adapter before the router sees it, so
 `router.providers` holds wrappers, not adapters — reach the adapter through
-`.inner` (ADR-001, ADR-002, ADR-020).
+`.inner` (ADR-001, ADR-002, ADR-020). The breaker's half-open trial is one
+call, and `allow()` returns a `Permit` so that only the call holding the
+trial slot can hand it back (ADR-030). A stream goes through the same loop
+as a completion — retries, breaker, hops — up to its first chunk and never
+after, so each wrapper's `stream()` is a generator that must close the
+stream it holds in a `finally` (ADR-032).
 
 `auth.py` answers *who is calling* and returns a `Principal`, never a token:
 `key_id` is public, stable, and safe to put in a Redis key or a log line, which
@@ -77,7 +84,9 @@ matters because everything downstream is keyed on it. Keys come from exactly one
 of three sources — a `keys.py` SQLite store (`VORTEX_KEY_DB_PATH`, hashed and
 revocable, minted by `vortex-keys`), the plaintext `VORTEX_API_KEYS` list, or
 development mode — never merged, because two allow-lists means revoking from one
-and still being let in by the other (ADR-003).
+and still being let in by the other (ADR-003). Development mode is refused at
+startup when `VORTEX_ENVIRONMENT` is `staging` or `prod`: `create_app` raises
+`OpenGatewayError` before it builds anything (ADR-035).
 
 `ratelimit.py`, `pricing.py` and `spend.py` are the metering subsystem, and
 `metering.py` is the only one `routes.py` talks to: `admit` before the provider
@@ -86,9 +95,14 @@ has) or `discard` (it produced nothing). The limiter is a per-key RPM/TPM token
 bucket in one Lua script, because a request refused by the token bucket must not
 have already spent a request; the ledger stores integer token counts and prices
 them at read time, so a corrected price corrects the history (ADR-021, ADR-022).
+An estimate larger than the key's whole TPM is a `400`, not a `429`: a bucket
+never holds more than its capacity, so no wait would admit it, and it is
+decided from the key before Redis is asked (ADR-031).
 Both hang off one Redis connection and are absent together, controlled by
 `VORTEX_METERING_ENABLED` — off by default, so a local run needs no Redis. Both
-fail *open*, and Redis is deliberately not a readiness check: draining a working
+fail *open* — and do so within a bounded wait, because a Redis that accepts
+and never answers raises nothing, so the client carries a 0.25 s socket
+timeout (ADR-033) — and Redis is deliberately not a readiness check: draining a working
 instance because the limiter is degraded turns a degradation into an outage.
 
 `cache.py` is the exact response cache (ADR-004), and it is shaped like
@@ -142,10 +156,13 @@ until `span()` learned to return a shared inert one (ADR-029, `bench/`).
 `configure_tracing` returns *ownership*, not liveness, because OTel's provider
 is a process global that refuses replacement.
 
-`middleware.py` now holds two raw-ASGI middlewares and their order is
+`middleware.py` now holds three raw-ASGI middlewares and their order is
 load-bearing: `RequestIDMiddleware` is outermost because it clears structlog's
 context vars on entry, and `TelemetryMiddleware` sits just inside so the trace
-and span IDs land in the same context the request ID rides in. The telemetry
+and span IDs land in the same context the request ID rides in.
+`BodyLimitMiddleware` is innermost and refuses an oversized body with a `413`
+before FastAPI buffers it — and so before the API key is checked, because
+FastAPI reads the body before any dependency runs (ADR-013, ADR-034). The telemetry
 middleware opens the server span, records the request counters and histograms,
 and measures time to first token — which is the gap to the first
 `http.response.body` message carrying bytes, and is the one thing no other

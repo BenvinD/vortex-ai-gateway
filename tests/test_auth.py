@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from vortex_ai_gateway.auth import Principal, _from_record, _from_token
+from vortex_ai_gateway.auth import OpenGatewayError, Principal, _from_record, _from_token
 from vortex_ai_gateway.config import Settings
 from vortex_ai_gateway.gateway import create_app
 from vortex_ai_gateway.keys import KeyStore, fingerprint
@@ -224,3 +224,75 @@ def test_a_principal_with_no_limits_is_not_metered() -> None:
     assert Principal(key_id="abc").metered is False
     assert Principal(key_id="abc", rpm=1).metered is True
     assert Principal(key_id="abc", tpm=1).metered is True
+
+
+@pytest.mark.parametrize(
+    ("content", "content_type", "status", "error_type"),
+    [
+        (b"{not json", "application/json", 400, "invalid_request_error"),
+        (b"{not json", "text/plain", 401, "authentication_error"),
+        (
+            b'{"model": "gpt-4o-mini", "messages": [], "n": 0}',
+            "application/json",
+            401,
+            "authentication_error",
+        ),
+    ],
+    ids=[
+        "malformed-json-is-decoded-first",
+        "a-body-not-labelled-json-is-not-decoded",
+        "invalid-schema-waits-for-auth",
+    ],
+)
+def test_auth_runs_after_json_decoding_and_before_schema_validation(
+    provider: MockProvider, content: bytes, content_type: str, status: int, error_type: str
+) -> None:
+    """FastAPI decodes a JSON-labelled body before dependencies, and validates after (ADR-013).
+
+    So with no key, unparseable bytes sent as JSON are a 400, and every other
+    body learns nothing about its own validity. The ADR said "before body
+    validation" for all of them until this was measured.
+    """
+    response = build_client(provider, api_keys="real-key").post(
+        CHAT_URL, content=content, headers={"Content-Type": content_type}
+    )
+
+    assert response.status_code == status
+    assert response.json()["error"]["type"] == error_type
+    assert provider.call_count == 0
+
+
+@pytest.mark.parametrize("environment", ["staging", "prod"])
+def test_a_guarded_environment_with_no_key_source_refuses_to_boot(environment: str) -> None:
+    """Development mode there is an open proxy to paid providers (ADR-035)."""
+    settings = Settings(_env_file=None, environment=environment)
+
+    with pytest.raises(OpenGatewayError, match="VORTEX_KEY_DB_PATH"):
+        create_app(settings=settings, provider=MockProvider())
+
+
+@pytest.mark.parametrize(
+    "source",
+    [{"api_keys": "real-key"}, {"key_db_path": "keys.db"}],
+    ids=["allow-list", "key-store"],
+)
+def test_a_guarded_environment_boots_with_either_key_source(
+    source: dict[str, str], tmp_path: Path
+) -> None:
+    if "key_db_path" in source:
+        source = {"key_db_path": str(tmp_path / source["key_db_path"])}
+    settings = Settings(_env_file=None, environment="prod", **source)  # type: ignore[arg-type]
+
+    create_app(settings=settings, provider=MockProvider())
+
+
+@pytest.mark.parametrize("environment", ["local", "dev"])
+def test_development_mode_still_boots_where_it_is_meant_to(
+    environment: str, provider: MockProvider
+) -> None:
+    settings = Settings(_env_file=None, environment=environment)
+    client = TestClient(create_app(settings=settings, provider=provider))
+
+    response = client.post(CHAT_URL, json=BODY, headers={"Authorization": "Bearer anything"})
+
+    assert response.status_code == 200

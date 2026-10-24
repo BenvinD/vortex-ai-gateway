@@ -82,6 +82,25 @@ class RateLimitedError(GatewayError):
         )
 
 
+class RequestTooLargeError(GatewayError):
+    """The request can never fit inside the caller's token allowance (ADR-031).
+
+    Not a :class:`RateLimitedError`, on purpose. A ``429`` says "wait", and
+    carries a ``Retry-After`` saying how long; for a request whose estimate is
+    larger than the whole bucket, no wait is long enough, and every OpenAI SDK
+    retries a ``429`` by itself. A ``400`` says "change the request", which is
+    the only thing that can help — so it carries no ``Retry-After`` at all.
+    """
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(
+            message,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            error_type="invalid_request_error",
+            code=code,
+        )
+
+
 def install_error_handlers(app: FastAPI) -> None:
     """Register the handlers that render every failure as an envelope."""
 
@@ -106,4 +125,37 @@ def install_error_handlers(app: FastAPI) -> None:
             status_code=exc.status_code,
             content={"error": exc.detail.model_dump(mode="json")},
             headers=exc.headers or None,
+        )
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+        """Render a bug as an envelope a client can parse and quote back.
+
+        Starlette gives an ``Exception`` handler to ``ServerErrorMiddleware``,
+        which sits *outside* every middleware the app adds — so this response
+        never passes through :class:`~vortex_ai_gateway.middleware.RequestIDMiddleware`
+        and the ID is set here, from the ``request.state`` that middleware
+        wrote. It has already logged the traceback under that same ID, which is
+        why nothing is logged here, and why the ID is the one thing the caller
+        needs: it is how a report finds that log line.
+
+        The message names nothing about the failure. An exception's text is
+        written for whoever reads the log, and can carry a URL, a key prefix or
+        a stack of internals a caller has no business seeing.
+        """
+        # Imported here, not at the top: `auth` imports this module, and
+        # `middleware` imports `auth` by way of `cache`.
+        from vortex_ai_gateway.middleware import REQUEST_ID_HEADER
+
+        request_id: str | None = getattr(request.state, "request_id", None)
+        reference = f" Quote request ID {request_id} when reporting it." if request_id else ""
+        detail = ErrorDetail(
+            message=f"The gateway failed unexpectedly.{reference}",
+            type="api_error",
+            code="internal_error",
+        )
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"error": detail.model_dump(mode="json")},
+            headers={REQUEST_ID_HEADER: request_id} if request_id else None,
         )

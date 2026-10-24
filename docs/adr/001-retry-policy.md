@@ -24,3 +24,6 @@ relationship — deadline > timeout — which a config validator should eventual
 enforce rather than a comment. Streams are not retried at all: past the first
 chunk the `200` is committed, and a retry would splice two generations into one
 body. We revisit if establishing-phase stream retries turn out to matter.
+Update (2026-10-18): they did. A stream is now retried exactly as a completion
+is, by the same loop, up to its first chunk — before which nothing has been
+sent — and never after it (ADR-032).

@@ -42,6 +42,7 @@ with (ADR-026, ADR-027).
 """
 
 import asyncio
+import math
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Final
@@ -54,6 +55,7 @@ from starlette.responses import Response
 from vortex_ai_gateway.auth import Principal, require_api_key
 from vortex_ai_gateway.cache import ResponseCache
 from vortex_ai_gateway.contracts import (
+    ChatCompletionChunk,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ErrorDetail,
@@ -196,10 +198,12 @@ def create_chat_router(
     ) -> Response:
         """Serve a chat completion, streamed or whole.
 
-        A streaming request cannot report a failure with a status code — the
-        ``200`` is already on the wire by the time the provider breaks — so the
-        two paths diverge here: a ``502`` envelope for the buffered case, an
-        error event mid-stream for the other.
+        Both paths report a failure with a status code for as long as they can.
+        A stream holds its ``200`` until the first chunk is in hand (ADR-032),
+        so an unroutable model, an open breaker or an upstream that fails
+        before producing anything is a ``404`` or ``502`` envelope exactly as on
+        the buffered path. Only a failure *after* the first chunk — once the
+        ``200`` is on the wire — becomes an error event mid-stream.
 
         Admission happens before either path, and before the provider is
         touched: the whole point of a limit is that an over-quota request costs
@@ -259,8 +263,36 @@ def create_chat_router(
             )
 
         if request.stream:
+            # Created before the wait, so its duration is the whole request and
+            # every streamed request writes one record however it ends.
+            record = StreamRecord(provider=provider.name, model=request.model)
+            try:
+                # The `200` is held until the first chunk is in hand (ADR-032).
+                # Until then nothing has been sent: an unroutable model, an
+                # open breaker, or an upstream that fails even after the
+                # retries and hops the wrappers apply is a status code, exactly
+                # as on the buffered path. The gateway asks for usage on every
+                # stream; only the forwarding is conditional (`streaming.metered`).
+                with span(
+                    "provider.stream",
+                    {"vortex.provider": provider.name, "vortex.model": request.model},
+                ):
+                    stream = provider.stream(metered(request))
+                    first = await anext(stream, None)
+            except asyncio.CancelledError:
+                # Cancelled while waiting — a shutdown, or anything above us
+                # giving up. The same trail as a stream abandoned mid-way: the
+                # upstream may already have been paid for the prompt (ADR-019).
+                record.outcome = "abandoned"
+                record.log()
+                await _settle_stream(meter, reservation, record)
+                raise
+            except Exception as exc:
+                record.outcome = "failed"
+                record.log()
+                return await _failed(exc, provider, request, meter, reservation, headers)
             return StreamingResponse(
-                _stream_events(provider, request, meter, reservation),
+                _stream_events(provider, request, record, stream, first, meter, reservation),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-store",
@@ -276,17 +308,7 @@ def create_chat_router(
             ):
                 completion = await provider.complete(request)
         except Exception as exc:
-            logger.exception("provider request failed", provider=provider.name, model=request.model)
-            await meter.discard(reservation)
-            http_status, envelope = _failure(exc)
-            retry_after = getattr(exc, "retry_after", None)
-            if retry_after:
-                headers["Retry-After"] = str(int(retry_after))
-            return JSONResponse(
-                status_code=http_status,
-                content=envelope.model_dump(mode="json"),
-                headers=headers or None,
-            )
+            return await _failed(exc, provider, request, meter, reservation, headers)
 
         _served_by(http_request, completion)
         await meter.settle(reservation, completion.usage)
@@ -322,6 +344,38 @@ def create_chat_router(
         return await meter.ledger.report(principal.key_id, days=days)
 
     return router
+
+
+async def _failed(
+    exc: Exception,
+    provider: ChatProvider,
+    request: ChatCompletionRequest,
+    meter: Meter,
+    reservation: Reservation,
+    headers: dict[str, str],
+) -> JSONResponse:
+    """The response for a request that failed before anything was sent.
+
+    One path for both shapes of request, because before the status line a
+    stream is no different from a buffered call: the failure can still be a
+    status code, and the reservation comes back in full, since nothing was
+    generated. Called from inside the ``except`` that caught ``exc``, so the log
+    line carries its traceback.
+    """
+    logger.exception("provider request failed", provider=provider.name, model=request.model)
+    await meter.discard(reservation)
+    http_status, envelope = _failure(exc)
+    retry_after = getattr(exc, "retry_after", None)
+    if retry_after is not None:
+        # Ceiling, and never zero, as the limiter's own 429 does: truncating
+        # turned a 0.4s breaker wait into `Retry-After: 0`, which invites a
+        # client straight back into the same refusal.
+        headers["Retry-After"] = str(max(1, math.ceil(retry_after)))
+    return JSONResponse(
+        status_code=http_status,
+        content=envelope.model_dump(mode="json"),
+        headers=headers or None,
+    )
 
 
 def _mark(current: Span, outcome: str | None, score: float | None = None) -> None:
@@ -360,10 +414,18 @@ def _today() -> str:
 async def _stream_events(
     provider: ChatProvider,
     request: ChatCompletionRequest,
+    record: StreamRecord,
+    stream: AsyncIterator[ChatCompletionChunk],
+    first: ChatCompletionChunk | None,
     meter: Meter,
     reservation: Reservation,
 ) -> AsyncIterator[str]:
     """Yield the SSE body for a streaming completion.
+
+    The route has already awaited ``first`` — ``None`` for a stream that ended
+    without a chunk — and committed the ``200`` on the strength of it
+    (ADR-032). By the time this runs, the only way left to report a failure is
+    an event.
 
     Three ways this ends, and all three have to leave the same trail — a
     :class:`~vortex_ai_gateway.streaming.StreamRecord` naming what the request
@@ -384,17 +446,20 @@ async def _stream_events(
     branch already misses them, and a reader should not have to know that to
     see that an abandonment is handled.
     """
-    record = StreamRecord(provider=provider.name, model=request.model)
     forward_usage = wants_usage(request)
-    # The gateway asks for usage on every stream; only the forwarding is
-    # conditional. See `streaming.metered`.
-    stream = provider.stream(metered(request))
+
+    def event(chunk: ChatCompletionChunk) -> str | None:
+        """Account for ``chunk`` and frame what the caller should be sent."""
+        forwarded = record.observe(chunk, forward_usage=forward_usage)
+        return None if forwarded is None else _sse(forwarded.model_dump_json(exclude_none=True))
+
     try:
         try:
+            if first is not None and (framed := event(first)) is not None:
+                yield framed
             async for chunk in stream:
-                forwarded = record.observe(chunk, forward_usage=forward_usage)
-                if forwarded is not None:
-                    yield _sse(forwarded.model_dump_json(exclude_none=True))
+                if (framed := event(chunk)) is not None:
+                    yield framed
         except asyncio.CancelledError, GeneratorExit:
             record.outcome = "abandoned"
             raise
@@ -424,11 +489,11 @@ _PENDING_SETTLEMENTS: set[asyncio.Task[None]] = set()
 async def _settle_stream(meter: Meter, reservation: Reservation, record: StreamRecord) -> None:
     """Release the stream's reservation and record what it actually cost.
 
-    A stream that failed before its first chunk generated nothing, so its
-    reservation comes back in full. Any other ending produced tokens — possibly
-    a number nobody has, which
-    :meth:`~vortex_ai_gateway.metering.Meter.settle` records as *unmetered*
-    rather than as free.
+    Every ending that reaches here may have produced tokens — possibly a
+    number nobody has, which :meth:`~vortex_ai_gateway.metering.Meter.settle`
+    records as *unmetered* rather than as free. A stream that failed before its
+    first chunk never gets here: the route answers it with a status and
+    releases its reservation in full, as it does a buffered failure (ADR-032).
 
     The abandoned case is spawned rather than awaited, and that asymmetry is the
     whole point of this function existing. For an abandoned stream this code
@@ -443,11 +508,7 @@ async def _settle_stream(meter: Meter, reservation: Reservation, record: StreamR
     Every other ending is awaited in place, where nothing is cancelling anything
     and the write landing before the response ends is worth having.
     """
-    if record.chunks == 0 and record.outcome == "failed":
-        settling = meter.discard(reservation)
-    else:
-        settling = meter.settle(reservation, record.usage)
-
+    settling = meter.settle(reservation, record.usage)
     if record.outcome != "abandoned":
         await settling
         return

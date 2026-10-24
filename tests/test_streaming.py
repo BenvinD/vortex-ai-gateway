@@ -26,6 +26,8 @@ from vortex_ai_gateway.contracts import (
 )
 from vortex_ai_gateway.gateway import create_app
 from vortex_ai_gateway.providers import MockProvider
+from vortex_ai_gateway.providers.resilience_wrapper import FallbackProvider, ResilientProvider
+from vortex_ai_gateway.resilience import CircuitBreaker, RetryPolicy
 from vortex_ai_gateway.streaming import STREAM_EVENT, StreamRecord, metered, wants_usage
 
 CHAT_URL = "/v1/chat/completions"
@@ -277,6 +279,89 @@ async def test_a_client_disconnect_tears_down_the_provider_stream() -> None:
     assert provider.closed, "the provider stream was left open, still generating"
     assert 0 < provider.tokens < 50, "generation continued long after the client left"
     assert delivered, "some tokens reached the client before it hung up"
+
+
+@pytest.mark.parametrize("shape", ["resilient", "fallback"])
+async def test_a_hang_up_reaches_the_adapter_through_the_resilience_wrappers(shape: str) -> None:
+    """ADR-019 through every generator layer the wrappers now add (ADR-032).
+
+    Here the cancellation lands inside the adapter, awaiting its upstream, so
+    the adapter unwinds itself; this passes with the wrappers' ``finally``
+    removed. ``test_closing_a_wrapped_stream_closes_the_adapter_at_once`` in
+    ``test_resilience.py`` is the one that pins the ``finally``.
+    """
+    endless = EndlessProvider()
+    wrapped = ResilientProvider(
+        inner=endless, policy=RetryPolicy(), breaker=CircuitBreaker(name="endless")
+    )
+    provider = wrapped if shape == "resilient" else FallbackProvider([wrapped, MockProvider()])
+    app = create_app(settings=Settings(_env_file=None), provider=provider)  # type: ignore[arg-type]
+
+    await stream_until_disconnect(app, json.dumps(body()).encode(), after=3)
+
+    assert endless.closed, "the adapter's stream was left open behind the wrapper"
+    assert 0 < endless.tokens < 50, "generation continued long after the client left"
+
+
+class NeverStarts:
+    """Accepts a stream and never produces its first chunk."""
+
+    name = "silent"
+
+    def __init__(self) -> None:
+        self.waiting = False
+        self.closed = False
+
+    async def complete(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
+        raise NotImplementedError("this provider only streams")
+
+    async def stream(self, request: ChatCompletionRequest) -> AsyncIterator[ChatCompletionChunk]:
+        try:
+            self.waiting = True
+            await asyncio.Event().wait()
+            yield  # type: ignore[misc]  # unreachable; makes this a generator
+        finally:
+            self.closed = True
+
+
+async def test_a_request_cancelled_before_its_first_chunk_is_recorded_as_abandoned(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """No status line went out, but the upstream may have billed the prompt (ADR-019).
+
+    The route now waits for the first chunk itself, so a cancellation can land
+    there — outside the SSE generator whose ``finally`` used to write the record.
+    """
+    provider = NeverStarts()
+    app = create_app(settings=Settings(_env_file=None), provider=provider)  # type: ignore[arg-type]
+    payload = json.dumps(body()).encode()
+    inbound = [{"type": "http.request", "body": payload, "more_body": False}]
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        if inbound:
+            return inbound.pop(0)
+        await asyncio.Event().wait()
+        return {"type": "http.disconnect"}  # pragma: no cover - never reached
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    request = asyncio.create_task(app(scope_for(payload), receive, send))
+    for _ in range(100):
+        if provider.waiting:
+            break
+        await asyncio.sleep(0)
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    structlog.contextvars.clear_contextvars()
+
+    assert provider.closed, "the upstream was left open"
+    assert not sent, "no status line went out"
+    (record,) = records(capsys.readouterr().out, STREAM_EVENT)
+    assert record["outcome"] == "abandoned"
+    assert record["chunks"] == 0
 
 
 async def test_an_abandoned_stream_is_recorded_as_abandoned(
