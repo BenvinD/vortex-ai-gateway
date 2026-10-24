@@ -197,10 +197,12 @@ def create_chat_router(
     ) -> Response:
         """Serve a chat completion, streamed or whole.
 
-        A streaming request cannot report a failure with a status code — the
-        ``200`` is already on the wire by the time the provider breaks — so the
-        two paths diverge here: a ``502`` envelope for the buffered case, an
-        error event mid-stream for the other.
+        Both paths report a failure with a status code for as long as they can.
+        A stream holds its ``200`` until the first chunk is in hand (ADR-032),
+        so an unroutable model, an open breaker or an upstream that fails
+        before producing anything is a ``404`` or ``502`` envelope exactly as on
+        the buffered path. Only a failure *after* the first chunk — once the
+        ``200`` is on the wire — becomes an error event mid-stream.
 
         Admission happens before either path, and before the provider is
         touched: the whole point of a limit is that an over-quota request costs

@@ -12,6 +12,7 @@ from vortex_ai_gateway.providers import CannedReply, MockProvider
 from vortex_ai_gateway.providers.errors import ProviderUnavailable
 from vortex_ai_gateway.providers.resilience_wrapper import ResilientProvider
 from vortex_ai_gateway.resilience import CircuitBreaker
+from vortex_ai_gateway.routing import ProviderRouter, parse_routes
 
 CHAT_URL = "/v1/chat/completions"
 
@@ -148,6 +149,24 @@ def test_a_stream_that_fails_before_its_first_chunk_is_a_status_code() -> None:
     error = response.json()["error"]
     assert error["type"] == "api_error"
     assert "connection reset" in error["message"]
+
+
+def test_a_stream_to_an_unknown_model_is_a_404() -> None:
+    """The router refuses before any provider is asked, so no 200 goes out (ADR-032).
+
+    This was an empty 200: the refusal surfaced only once the SSE body was
+    iterated, after the status line had been sent.
+    """
+    mock = MockProvider()
+    client = serving(ProviderRouter(routes=parse_routes("gpt-*=mock"), providers={"mock": mock}))
+
+    response = client.post(CHAT_URL, json=body(model="nobody-serves-this", stream=True))
+
+    assert response.status_code == 404
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "model_not_found"
+    assert mock.received_requests == []
 
 
 def test_a_stream_that_fails_after_its_first_chunk_ends_with_an_error_event() -> None:
