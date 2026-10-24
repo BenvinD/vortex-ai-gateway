@@ -30,3 +30,13 @@ makes the limit mean tokens. Fail-open means a Redis outage is an unlimited
 gateway; the rejected option wins if the limits ever become a contractual quota
 rather than a protection, and then the answer is fail-closed with a much louder
 alarm, not a readiness probe.
+Update (2026-10-24): the two bucket keys are now hash-tagged,
+`vortex:rl:{<key_id>}:requests` and `...:tokens`, so they share one Redis
+Cluster slot and the admit script cannot fail with `CROSSSLOT`. That is
+necessary for Cluster and not sufficient: the gateway builds its client with
+`Redis.from_url`, not `RedisCluster`, so pointed at a real cluster it gets
+`MOVED` redirects whatever the keys are called. Cluster is not supported yet.
+The rename also reset every bucket once: on deploy, the old
+`vortex:rl:<key_id>:*` keys are orphaned until their idle TTL expires and every
+key starts again full, which admits at most one extra window per key. A step
+in the admission graphs at that deploy is this, not a limiter fault.

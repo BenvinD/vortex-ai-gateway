@@ -24,5 +24,6 @@ no key and no config still serves a real request end to end, which is what makes
 the seam demonstrable. The startup warning is the whole mitigation, and it is a
 thin one — the safer answer is a boot-time refusal when `environment` is `prod`
 and no routing table is configured, which is a better rule than `501` because it
-distinguishes "unconfigured laptop" from "unconfigured deployment". Response bodies are dumped with
+distinguishes "unconfigured laptop" from "unconfigured deployment" — and
+ADR-035 now does exactly that, for `staging` as well as `prod`. Response bodies are dumped with
 `exclude_none`, so absent fields are omitted rather than sent as `null`.

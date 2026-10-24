@@ -282,6 +282,10 @@ class RateLimiter:
         The admit script touches both in one call, and Cluster refuses a script
         whose keys span slots with ``CROSSSLOT``; only the part in braces is
         hashed. A ``key_id`` is hex, so it can never contain a brace itself.
+
+        Necessary for Cluster, not sufficient: the gateway's client is a plain
+        ``Redis``, not ``RedisCluster``, so a real cluster answers it with
+        ``MOVED`` regardless. Cluster is not supported yet (ADR-021).
         """
         tag = f"{{{key_id}}}"
         return [f"{self.prefix}:{tag}:requests", f"{self.prefix}:{tag}:tokens"]

@@ -20,3 +20,11 @@ message naming both variables, instead of serving. Serving the mock provider
 in prod is not refused here — a wrong answer, not an open door. Revisit if an
 environment other than these four is added, since the guard names the ones it
 guards rather than the ones it lets through.
+Update (2026-10-24, later): the mock is refused too. Review pointed out that it
+is not "a wrong answer, not an open door" in practice: the mock answers every
+request with a `200` priced at $0 by the `mock-*` rule, so nothing errors and
+nothing alerts, and it is found later than an open gateway would be. In staging
+and prod, `create_app` now raises `RoutingConfigError` where it would otherwise
+fall back to the mock, i.e. when neither `VORTEX_MODEL_ROUTES` nor
+`VORTEX_DEFAULT_PROVIDER` is set and no provider was passed in. This is the
+boot-time refusal ADR-012's update asked for.

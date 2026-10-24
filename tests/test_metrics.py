@@ -25,7 +25,7 @@ from tests.test_cache import body, client_for
 from tests.test_resilience import ScriptedProvider, resilient
 from tests.test_streaming import EndlessProvider, stream_until_disconnect
 from tests.upstream import chat_request
-from vortex_ai_gateway import metrics
+from vortex_ai_gateway import __version__, metrics
 from vortex_ai_gateway.auth import Principal
 from vortex_ai_gateway.config import Settings
 from vortex_ai_gateway.contracts import (
@@ -139,7 +139,7 @@ async def test_build_info_names_the_version_and_environment() -> None:
     async with client_for(build(environment="staging", api_keys="k")) as client:
         await client.get("/metrics")
 
-    assert value("vortex_build_info", version="0.1.0", environment="staging") == 1.0
+    assert value("vortex_build_info", version=__version__, environment="staging") == 1.0
 
 
 # --- what a request records ------------------------------------------------
