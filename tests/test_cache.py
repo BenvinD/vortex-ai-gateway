@@ -453,7 +453,7 @@ async def test_a_hit_returns_the_token_reservation(
         # Read after the fact rather than from the response header: the header
         # reports the bucket as it was at *admission*, which is before the
         # settlement this test is about.
-        level = float(await redis.hget(f"vortex:rl:{minted.record.key_id}:tokens", "tokens"))
+        level = float(await redis.hget(f"vortex:rl:{{{minted.record.key_id}}}:tokens", "tokens"))
 
     assert hit.headers[CACHE_HEADER] == "HIT"
     # Each request reserves ~513 tokens (512 assumed completion + a one-token

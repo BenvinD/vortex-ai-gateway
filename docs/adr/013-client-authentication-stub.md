@@ -42,3 +42,5 @@ already knew — so this is recorded rather than fixed; moving auth into ASGI
 middleware to restore the old wording would buy nothing for that. What the
 wording hid is cost: every request's body is read in full before anyone checks
 the key, and nothing capped its size until ADR-034. `tests/test_auth.py` pins the ordering.
+Update (2026-10-24, later): the check this ADR said the repo still owed is
+ADR-035 — staging and prod refuse to start in development mode.

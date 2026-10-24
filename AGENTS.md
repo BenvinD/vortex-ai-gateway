@@ -84,7 +84,9 @@ matters because everything downstream is keyed on it. Keys come from exactly one
 of three sources — a `keys.py` SQLite store (`VORTEX_KEY_DB_PATH`, hashed and
 revocable, minted by `vortex-keys`), the plaintext `VORTEX_API_KEYS` list, or
 development mode — never merged, because two allow-lists means revoking from one
-and still being let in by the other (ADR-003).
+and still being let in by the other (ADR-003). Development mode is refused at
+startup when `VORTEX_ENVIRONMENT` is `staging` or `prod`: `create_app` raises
+`OpenGatewayError` before it builds anything (ADR-035).
 
 `ratelimit.py`, `pricing.py` and `spend.py` are the metering subsystem, and
 `metering.py` is the only one `routes.py` talks to: `admit` before the provider

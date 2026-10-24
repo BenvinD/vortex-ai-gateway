@@ -926,7 +926,7 @@ JSON, because JSON is a hostile format to type into a deployment console.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `VORTEX_ENVIRONMENT` | `local` | `local`, `dev`, `staging` or `prod`; a label on logs and `vortex_build_info` |
+| `VORTEX_ENVIRONMENT` | `local` | `local`, `dev`, `staging` or `prod`; a label on logs and `vortex_build_info`. `staging` and `prod` refuse to start with no key source (ADR-035) |
 | `VORTEX_LOG_LEVEL` | `INFO` | Python logging level name |
 | `VORTEX_REDIS_URL` | `redis://localhost:6379/0` | shared by the limiter, the ledger and both caches; only dialled when one is on |
 | `VORTEX_REDIS_SOCKET_TIMEOUT_SECONDS` | `0.25` | budget for one Redis call; past it, the caller fails open (ADR-033) |

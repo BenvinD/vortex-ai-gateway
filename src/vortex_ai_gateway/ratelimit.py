@@ -277,7 +277,14 @@ class RateLimiter:
         self._settle = redis.register_script(SETTLE_SCRIPT)
 
     def _keys(self, key_id: str) -> list[str]:
-        return [f"{self.prefix}:{key_id}:requests", f"{self.prefix}:{key_id}:tokens"]
+        """Both buckets for ``key_id``, hash-tagged into one Redis Cluster slot.
+
+        The admit script touches both in one call, and Cluster refuses a script
+        whose keys span slots with ``CROSSSLOT``; only the part in braces is
+        hashed. A ``key_id`` is hex, so it can never contain a brace itself.
+        """
+        tag = f"{{{key_id}}}"
+        return [f"{self.prefix}:{tag}:requests", f"{self.prefix}:{tag}:tokens"]
 
     def _now_ms(self) -> int:
         return int(self._clock() * 1000)

@@ -136,7 +136,7 @@ async def test_metrics_can_be_moved_off_the_default_path() -> None:
 
 
 async def test_build_info_names_the_version_and_environment() -> None:
-    async with client_for(build(environment="staging")) as client:
+    async with client_for(build(environment="staging", api_keys="k")) as client:
         await client.get("/metrics")
 
     assert value("vortex_build_info", version="0.1.0", environment="staging") == 1.0

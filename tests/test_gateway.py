@@ -22,7 +22,7 @@ def client() -> TestClient:
 
 def test_create_app_stores_injected_settings() -> None:
     """The factory keeps the passed-in settings on ``app.state``."""
-    settings = Settings(_env_file=None, environment="prod")
+    settings = Settings(_env_file=None, environment="prod", api_keys="k")
     app = create_app(settings=settings)
     assert app.state.settings is settings
 

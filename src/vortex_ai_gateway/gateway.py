@@ -20,6 +20,7 @@ from redis.asyncio import Redis
 from starlette.responses import PlainTextResponse
 
 from vortex_ai_gateway import __version__, metrics
+from vortex_ai_gateway.auth import ensure_key_source
 from vortex_ai_gateway.cache import ResponseCache
 from vortex_ai_gateway.config import Settings, get_settings
 from vortex_ai_gateway.embedding import build_embedder
@@ -82,6 +83,9 @@ def create_app(
     """
     settings = settings or get_settings()
     configure_logging(settings)
+    # First, before tracing, Redis or a provider is touched: a gateway that
+    # would boot open in staging or prod builds nothing at all (ADR-035).
+    ensure_key_source(settings)
     # Both are process-global and both are idempotent, which is what lets a
     # factory called once per test get away with calling them. Tracing is
     # one-way — see `tracing.configure_tracing` — and the label budget is

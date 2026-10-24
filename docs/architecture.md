@@ -289,7 +289,7 @@ price). Storing both wins the day prices must be frozen per request for audit.
 | State | Home | Lifetime | Shared across workers |
 |---|---|---|---|
 | API keys | SQLite, hashed | until revoked | one file, one node |
-| Rate-limit buckets | Redis `vortex:rl:<key_id>:{requests,tokens}` | 2 minutes idle | yes |
+| Rate-limit buckets | Redis `vortex:rl:{<key_id>}:requests` and `…:tokens`; the braces are a Cluster hash tag, so both land in one slot | 2 minutes idle | yes |
 | Usage ledger | Redis `vortex:usage:<key_id>:<YYYY-MM-DD>` | `VORTEX_USAGE_RETENTION_DAYS` | yes |
 | Cache entries | Redis `vortex:cache:<scope>:<path>:<sha256>` | per-route TTL | yes |
 | Breaker state | process memory | process | **no** |
