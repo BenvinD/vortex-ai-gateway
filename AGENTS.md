@@ -98,7 +98,9 @@ never holds more than its capacity, so no wait would admit it, and it is
 decided from the key before Redis is asked (ADR-031).
 Both hang off one Redis connection and are absent together, controlled by
 `VORTEX_METERING_ENABLED` — off by default, so a local run needs no Redis. Both
-fail *open*, and Redis is deliberately not a readiness check: draining a working
+fail *open* — and do so within a bounded wait, because a Redis that accepts
+and never answers raises nothing, so the client carries a 0.25 s socket
+timeout (ADR-033) — and Redis is deliberately not a readiness check: draining a working
 instance because the limiter is degraded turns a degradation into an outage.
 
 `cache.py` is the exact response cache (ADR-004), and it is shaped like

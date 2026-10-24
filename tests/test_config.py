@@ -24,6 +24,9 @@ def test_defaults_apply_with_no_environment(monkeypatch: pytest.MonkeyPatch) -> 
     assert settings.request_timeout_seconds == 30.0
     # Connecting gets a much shorter budget than answering (docs/notes/day-04.md).
     assert settings.connect_timeout_seconds == 5.0
+    # Redis is bounded, or failing open never gets the chance to (ADR-033).
+    assert settings.redis_socket_timeout_seconds == 0.25
+    assert settings.redis_connect_timeout_seconds == 0.5
     # No routing table configured: the gateway falls back to its mock provider.
     assert settings.model_routes == ""
     assert settings.default_provider == ""
