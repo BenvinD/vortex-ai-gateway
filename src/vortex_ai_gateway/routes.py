@@ -42,6 +42,7 @@ with (ADR-026, ADR-027).
 """
 
 import asyncio
+import math
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Final
@@ -365,8 +366,11 @@ async def _failed(
     await meter.discard(reservation)
     http_status, envelope = _failure(exc)
     retry_after = getattr(exc, "retry_after", None)
-    if retry_after:
-        headers["Retry-After"] = str(int(retry_after))
+    if retry_after is not None:
+        # Ceiling, and never zero, as the limiter's own 429 does: truncating
+        # turned a 0.4s breaker wait into `Retry-After: 0`, which invites a
+        # client straight back into the same refusal.
+        headers["Retry-After"] = str(max(1, math.ceil(retry_after)))
     return JSONResponse(
         status_code=http_status,
         content=envelope.model_dump(mode="json"),

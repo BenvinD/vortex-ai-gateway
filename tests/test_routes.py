@@ -9,7 +9,7 @@ from tests.test_resilience import DiesMidStream, ScriptedProvider, policy
 from vortex_ai_gateway.config import Settings
 from vortex_ai_gateway.gateway import create_app
 from vortex_ai_gateway.providers import CannedReply, MockProvider
-from vortex_ai_gateway.providers.errors import ProviderUnavailable
+from vortex_ai_gateway.providers.errors import CircuitOpenError, ProviderUnavailable
 from vortex_ai_gateway.providers.resilience_wrapper import ResilientProvider
 from vortex_ai_gateway.resilience import CircuitBreaker
 from vortex_ai_gateway.routing import ProviderRouter, parse_routes
@@ -224,3 +224,18 @@ def test_app_defaults_to_the_mock_provider() -> None:
 
     assert isinstance(app.state.provider, MockProvider)
     assert TestClient(app, headers=AUTH).post(CHAT_URL, json=body()).status_code == 200
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(("wait", "header"), [(0.0, "1"), (0.4, "1"), (1.2, "2"), (30.0, "30")])
+def test_retry_after_on_a_refusal_rounds_up_and_is_never_zero(
+    stream: bool, wait: float, header: str
+) -> None:
+    """A sub-second breaker wait used to truncate to `Retry-After: 0`."""
+    refused = CircuitOpenError("open", provider="primary", retry_after=wait)
+    client = serving(MockProvider(replies=[refused]))
+
+    response = client.post(CHAT_URL, json=body(stream=stream))
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == header
